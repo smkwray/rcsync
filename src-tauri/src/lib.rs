@@ -154,6 +154,39 @@ async fn push_all(dry_run: bool) -> Result<String, String> {
     Ok(all_output)
 }
 
+/// Bi-sync all configured projects
+#[tauri::command]
+async fn bisync_all() -> Result<String, String> {
+    let cfg = load_config();
+    let mut all_output = String::new();
+    let statuses = get_projects_status();
+
+    for ps in &statuses {
+        if !ps.exists_locally {
+            continue;
+        }
+        let project = match find_project(&cfg, &ps.name) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let cfg2 = cfg.clone();
+        let proj2 = project.clone();
+        match tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2)).await {
+            Ok(Ok(output)) => {
+                all_output.push_str(&format!("=== {} ===\n{}\n", ps.name, output));
+            }
+            Ok(Err(e)) => {
+                all_output.push_str(&format!("=== {} ERROR ===\n{}\n", ps.name, e));
+            }
+            Err(e) => {
+                all_output.push_str(&format!("=== {} FAILED ===\n{}\n", ps.name, e));
+            }
+        }
+    }
+
+    Ok(all_output)
+}
+
 /// Check all local projects, return a map of name -> check output
 #[tauri::command]
 async fn check_all() -> Result<std::collections::HashMap<String, String>, String> {
@@ -300,6 +333,7 @@ pub fn run() {
             check,
             bisync,
             push_all,
+            bisync_all,
             check_all,
             delete_local,
             browse_remote,

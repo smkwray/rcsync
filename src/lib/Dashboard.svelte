@@ -11,6 +11,7 @@
   let logLines: string[] = $state([]);
   let runningProjects: Map<string, string> = $state(new Map()); // name -> mode
   let pushingAll = $state(false);
+  let bisyncingAll = $state(false);
   let checkingAll = $state(false);
   let loaded = $state(false);
   let search = $state("");
@@ -256,6 +257,28 @@
     runningProjects = new Map();
   }
 
+  async function handleBisyncAll() {
+    const count = localProjects.length;
+    const ok = await customConfirm(
+      `Bi-Sync All (${count} projects)?`,
+      `Two-way sync all ${count} local projects with their remotes.\nChanges on both sides will be merged. Conflicts may arise.`,
+      "Bi-Sync All",
+    );
+    if (!ok) return;
+
+    bisyncingAll = true;
+    for (const p of localProjects) markRunning(p.name, "bisync");
+    logLines = [...logLines, "--- BI-SYNC ALL ---"];
+    try {
+      const result = await invoke<string>("bisync_all");
+      logLines = [...logLines, ...result.split("\n").filter((l) => l.trim())];
+    } catch (e) {
+      logLines = [...logLines, `[ERROR] ${e}`];
+    }
+    bisyncingAll = false;
+    runningProjects = new Map();
+  }
+
   function clearLog() { logLines = []; }
   function toggleShortcuts() { shortcutsEnabled = !shortcutsEnabled; }
   function toggleOutput() { showOutput = !showOutput; }
@@ -265,6 +288,9 @@
 
     if (confirmState) {
       if (e.key === "Escape") { e.preventDefault(); onConfirmNo(); }
+      // Let Tab and Enter through so the dialog buttons work naturally
+      if (e.key === "Tab" || e.key === "Enter") return;
+      e.preventDefault();
       return;
     }
 
@@ -306,6 +332,7 @@
       case "/": e.preventDefault(); filterInput?.focus(); break;
       case "c": if (!checkingAll) runCheckAll(); break;
       case "p": if (!pushingAll) handlePushAll(); break;
+      case "v": if (!bisyncingAll) handleBisyncAll(); break;
       case "x": clearLog(); break;
       case "o": toggleOutput(); break;
       case "b": window.dispatchEvent(new CustomEvent("open-browse")); break;
@@ -349,6 +376,9 @@
       </button>
       <button class="primary" disabled={pushingAll || !loaded || localProjects.length === 0} onclick={handlePushAll}>
         Push All
+      </button>
+      <button class="warn" disabled={bisyncingAll || !loaded || localProjects.length === 0} onclick={handleBisyncAll}>
+        {bisyncingAll ? "Bi-Syncing..." : "Bi-Sync All"}
       </button>
       <button onclick={toggleOutput} title="Cmd+O">{showOutput ? "Hide Log" : "Show Log"}</button>
       <button onclick={clearLog}>Clear</button>
@@ -438,4 +468,6 @@
   .log-body { flex: 1; overflow: hidden; animation: slideDown 0.2s ease; }
   @keyframes slideDown { from { opacity: 0; max-height: 0; } to { opacity: 1; max-height: 280px; } }
   .loading { color: var(--text-muted); font-style: italic; }
+  button.warn { border-color: var(--yellow); color: var(--yellow); }
+  button.warn:hover { background: var(--yellow-dim); }
 </style>

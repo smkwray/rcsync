@@ -29,6 +29,7 @@
       keys: [
         ["c", "Check All"],
         ["p", "Push All"],
+        ["v", "Bi-Sync All"],
         ["o", "Toggle output"],
         ["x", "Clear Log"],
         ["b", "Browse Remote"],
