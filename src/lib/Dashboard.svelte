@@ -8,7 +8,7 @@
 
   let projects: ProjectStatus[] = $state([]);
   let logLines: string[] = $state([]);
-  let runningProjects: Set<string> = $state(new Set());
+  let runningProjects: Map<string, string> = $state(new Map()); // name -> mode
   let pushingAll = $state(false);
   let checkingAll = $state(false);
   let loaded = $state(false);
@@ -20,33 +20,29 @@
   let gridEl: HTMLDivElement | undefined = $state(undefined);
   let filterInput: HTMLInputElement | undefined = $state(undefined);
 
-  // Custom confirm dialog state
   let confirmState: {
     title: string; message: string; confirmLabel: string; danger: boolean;
     resolve: (v: boolean) => void;
   } | null = $state(null);
 
   function customConfirm(title: string, message: string, confirmLabel = "Confirm", danger = true): Promise<boolean> {
-    return new Promise((resolve) => {
-      confirmState = { title, message, confirmLabel, danger, resolve };
-    });
+    return new Promise((resolve) => { confirmState = { title, message, confirmLabel, danger, resolve }; });
   }
-
-  function onConfirmYes() {
-    confirmState?.resolve(true);
-    confirmState = null;
-  }
-  function onConfirmNo() {
-    confirmState?.resolve(false);
-    confirmState = null;
-  }
+  function onConfirmYes() { confirmState?.resolve(true); confirmState = null; }
+  function onConfirmNo() { confirmState?.resolve(false); confirmState = null; }
 
   let checkStatuses: Record<string, { time: string; synced: boolean; diffs: number }> = $state(
     JSON.parse(localStorage.getItem("rcsync-check-statuses") || "{}")
   );
 
+  // Pinned projects (stored by name)
+  let pinnedNames: string[] = $state(
+    JSON.parse(localStorage.getItem("rcsync-pinned") || "[]")
+  );
+
   $effect(() => { localStorage.setItem("rcsync-check-statuses", JSON.stringify(checkStatuses)); });
   $effect(() => { localStorage.setItem("rcsync-shortcuts", String(shortcutsEnabled)); });
+  $effect(() => { localStorage.setItem("rcsync-pinned", JSON.stringify(pinnedNames)); });
 
   $effect(() => {
     if (selectedIndex >= 0 && gridEl) {
@@ -57,6 +53,17 @@
 
   let localProjects = $derived(projects.filter((p) => p.exists_locally));
 
+  // Sort: pinned first, then alphabetical
+  let sortedProjects = $derived(() => {
+    const pinSet = new Set(pinnedNames);
+    return [...localProjects].sort((a, b) => {
+      const ap = pinSet.has(a.name) ? 0 : 1;
+      const bp = pinSet.has(b.name) ? 0 : 1;
+      if (ap !== bp) return ap - bp;
+      return a.name.localeCompare(b.name);
+    });
+  });
+
   function fuzzyMatch(q: string, t: string): boolean {
     const ql = q.toLowerCase(), tl = t.toLowerCase();
     let qi = 0;
@@ -65,7 +72,7 @@
   }
 
   let filteredProjects = $derived(
-    search.trim() ? localProjects.filter((p) => fuzzyMatch(search.trim(), p.name)) : localProjects
+    search.trim() ? sortedProjects().filter((p) => fuzzyMatch(search.trim(), p.name)) : sortedProjects()
   );
 
   function shortTime(): string {
@@ -86,7 +93,7 @@
   }
 
   function toProject(ps: ProjectStatus): Project {
-    return { name: ps.name, local_path: ps.local_path, remote_path: ps.remote_path };
+    return { name: ps.name, local_path: ps.local_path, remote_path: ps.remote_path, remote: ps.remote };
   }
 
   function ensureSelected(): ProjectStatus | null {
@@ -110,29 +117,44 @@
     logLines = [...logLines, ...lines.map((l) => `[${project}] ${l}`)];
   }
 
-  function markRunning(name: string) { runningProjects = new Set([...runningProjects, name]); }
-  function markDone(name: string) { const s = new Set(runningProjects); s.delete(name); runningProjects = s; }
+  function markRunning(name: string, mode: string) {
+    runningProjects = new Map([...runningProjects, [name, mode]]);
+  }
+
+  function markDone(name: string) {
+    const m = new Map(runningProjects);
+    m.delete(name);
+    runningProjects = m;
+  }
+
+  function togglePin(project: Project) {
+    const idx = pinnedNames.indexOf(project.name);
+    if (idx >= 0) {
+      pinnedNames = pinnedNames.filter((n) => n !== project.name);
+    } else {
+      pinnedNames = [...pinnedNames, project.name];
+    }
+  }
 
   async function handleAction(project: Project, mode: SyncMode) {
-    // Dangerous actions need custom confirmation (default No)
     if (mode === "pull") {
       const ok = await customConfirm(
         `Pull "${project.name}"?`,
-        `This will overwrite local files with Drive contents.\nLocal is always authoritative — only pull if the remote version is what you want.`,
-        "Pull from Drive",
+        `This will overwrite local files with ${project.remote} contents.\nLocal is always authoritative — only pull if the remote version is what you want.`,
+        "Pull from Remote",
       );
       if (!ok) return;
     }
     if (mode === "bisync") {
       const ok = await customConfirm(
         `Bi-Sync "${project.name}"?`,
-        `Two-way sync between local and Drive.\nChanges on both sides will be merged. Conflicts may arise.\nUse with caution.`,
+        `Two-way sync between local and ${project.remote}.\nChanges on both sides will be merged. Conflicts may arise.`,
         "Bi-Sync",
       );
       if (!ok) return;
     }
 
-    markRunning(project.name);
+    markRunning(project.name, mode);
     logLines = [...logLines, `--- ${mode.toUpperCase()} ${project.name} ---`];
 
     try {
@@ -151,6 +173,10 @@
       }
       if (result) addLog(project.name, result);
       logLines = [...logLines, `[${project.name}] Done.`];
+      // After successful push/pull/bisync, mark as synced
+      if (mode === "push" || mode === "pull" || mode === "bisync") {
+        checkStatuses = { ...checkStatuses, [project.name]: { time: shortTime(), synced: true, diffs: 0 } };
+      }
     } catch (e) {
       logLines = [...logLines, `[${project.name}] ERROR: ${e}`];
     }
@@ -160,16 +186,11 @@
   async function handleDelete(project: Project) {
     const ok = await customConfirm(
       `Delete "${project.name}" locally?`,
-      `Path: ${project.local_path}\n\nThe remote copy on Google Drive is NOT affected.\nThis permanently deletes the local directory.`,
+      `Path: ${project.local_path}\n\nThe remote copy on ${project.remote} is NOT affected.\nThis permanently deletes the local directory.`,
       "Delete Local Copy",
     );
     if (!ok) return;
-
-    const really = await customConfirm(
-      "Final confirmation",
-      `Are you absolutely sure you want to permanently delete "${project.name}" from this device?`,
-      "Yes, Delete",
-    );
+    const really = await customConfirm("Final confirmation", `Permanently delete "${project.name}" from this device?`, "Yes, Delete");
     if (!really) return;
 
     try {
@@ -181,12 +202,16 @@
     }
   }
 
+  // Parallel check all — runs up to 4 checks concurrently
   async function runCheckAll(silent = false) {
     checkingAll = true;
     if (!silent) logLines = [...logLines, "--- CHECK ALL ---"];
 
-    for (const ps of localProjects) {
-      markRunning(ps.name);
+    const CONCURRENCY = 4;
+    const queue = [...localProjects];
+
+    async function checkOne(ps: ProjectStatus) {
+      markRunning(ps.name, "check");
       try {
         const result = await invoke<string>("check", { projectName: ps.name });
         checkStatuses = { ...checkStatuses, [ps.name]: { time: shortTime(), ...parseCheckResult(result) } };
@@ -197,13 +222,19 @@
       markDone(ps.name);
     }
 
+    // Process in batches of CONCURRENCY
+    while (queue.length > 0) {
+      const batch = queue.splice(0, CONCURRENCY);
+      await Promise.all(batch.map(checkOne));
+    }
+
     if (!silent) logLines = [...logLines, "Check all complete."];
     checkingAll = false;
   }
 
   async function handlePushAll() {
     pushingAll = true;
-    for (const p of localProjects) markRunning(p.name);
+    for (const p of localProjects) markRunning(p.name, "push");
     logLines = [...logLines, "--- PUSH ALL ---"];
     try {
       const result = await invoke<string>("push_all", { dryRun: false });
@@ -212,7 +243,7 @@
       logLines = [...logLines, `[ERROR] ${e}`];
     }
     pushingAll = false;
-    runningProjects = new Set();
+    runningProjects = new Map();
   }
 
   function clearLog() { logLines = []; }
@@ -222,13 +253,11 @@
   function handleKeydown(e: KeyboardEvent) {
     const inInput = document.activeElement?.tagName === "INPUT";
 
-    // When confirm dialog is open, only Escape works (to dismiss it)
     if (confirmState) {
       if (e.key === "Escape") { e.preventDefault(); onConfirmNo(); }
       return;
     }
 
-    // === ALWAYS-ON ===
     if (e.metaKey && e.key === ",") { e.preventDefault(); window.dispatchEvent(new CustomEvent("open-settings")); return; }
     if (e.metaKey && e.key === "k") { e.preventDefault(); toggleShortcuts(); return; }
     if (e.metaKey && e.key === "o") { e.preventDefault(); toggleOutput(); return; }
@@ -246,7 +275,6 @@
       e.preventDefault(); showShortcutsHelp = !showShortcutsHelp; return;
     }
 
-    // === TOGGLED ===
     if (!shortcutsEnabled || inInput) return;
 
     const len = filteredProjects.length;
@@ -264,6 +292,7 @@
       case "f": { const s = ensureSelected(); if (s) handleAction(toProject(s), "bisync"); } break;
       case "g": { const s = ensureSelected(); if (s) handleAction(toProject(s), "pull"); } break;
       case "h": { const s = ensureSelected(); if (s) handleDelete(toProject(s)); } break;
+      case "i": { const s = ensureSelected(); if (s) togglePin(toProject(s)); } break;
       case "/": e.preventDefault(); filterInput?.focus(); break;
       case "c": if (!checkingAll) runCheckAll(); break;
       case "p": if (!pushingAll) handlePushAll(); break;
@@ -318,9 +347,12 @@
             <ProjectCard
               project={toProject(project)}
               running={runningProjects.has(project.name)}
+              runningMode={runningProjects.get(project.name) ?? ""}
               checkStatus={checkStatuses[project.name] ?? null}
+              pinned={pinnedNames.includes(project.name)}
               onaction={handleAction}
               ondelete={handleDelete}
+              onpin={togglePin}
             />
           </div>
         {/each}

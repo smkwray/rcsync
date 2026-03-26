@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import type { AppConfig, Project } from "./types";
 
   let {
@@ -15,6 +16,23 @@
   let newScanDir = $state("");
   let saving = $state(false);
   let newProject: Project = $state({ name: "", local_path: "", remote_path: "" });
+  let startAtLogin = $state(false);
+
+  // Load current autostart state
+  isEnabled().then((v) => { startAtLogin = v; }).catch(() => {});
+
+  async function toggleAutostart() {
+    try {
+      if (startAtLogin) {
+        await enable();
+      } else {
+        await disable();
+      }
+    } catch (e) {
+      alert(`Failed to update login item: ${e}`);
+      startAtLogin = !startAtLogin; // revert
+    }
+  }
 
   async function save() {
     saving = true;
@@ -88,6 +106,10 @@
         <label class="checkbox-field">
           <input type="checkbox" bind:checked={editConfig.auto_check_on_launch} />
           Auto-check all projects on launch
+        </label>
+        <label class="checkbox-field">
+          <input type="checkbox" bind:checked={startAtLogin} onchange={toggleAutostart} />
+          Start at login
         </label>
       </section>
 

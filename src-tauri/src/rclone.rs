@@ -77,7 +77,7 @@ pub fn sync_project(
     } else {
         check_local_path(project)?
     };
-    let remote = cfg.remote_path_for(&project.name);
+    let remote = cfg.remote_path_for_project(project);
 
     let (src, dst) = match mode {
         "pull" => (remote, local),
@@ -101,7 +101,7 @@ pub fn sync_project(
 
 pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, String> {
     let local = check_local_path(project)?;
-    let remote = cfg.remote_path_for(&project.name);
+    let remote = cfg.remote_path_for_project(project);
 
     let mut args = vec!["bisync".to_string(), local, remote];
     args.extend(build_exclude_args(cfg));
@@ -117,7 +117,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
 
 pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<String, String> {
     let local = check_local_path(project)?;
-    let remote = cfg.remote_path_for(&project.name);
+    let remote = cfg.remote_path_for_project(project);
 
     let mut args = vec![
         "check".to_string(),

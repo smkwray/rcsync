@@ -2,6 +2,7 @@ export interface Project {
   name: string;
   local_path: string;
   remote_path: string;
+  remote: string;
 }
 
 export interface RemoteConfig {
@@ -16,6 +17,7 @@ export interface AppConfig {
   remotes: RemoteConfig[];
   projects: Project[];
   scan_dirs: string[];
+  default_pull_dir: string;
   auto_check_on_launch: boolean;
 }
 
@@ -37,6 +39,7 @@ export interface ProjectStatus {
   name: string;
   local_path: string;
   remote_path: string;
+  remote: string;
   exists_locally: boolean;
 }
 

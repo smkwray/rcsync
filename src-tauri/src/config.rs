@@ -7,6 +7,9 @@ pub struct Project {
     pub name: String,
     pub local_path: String,
     pub remote_path: String,
+    /// Which remote this project syncs with. Empty/missing = first remote in list.
+    #[serde(default)]
+    pub remote: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +31,9 @@ pub struct AppConfig {
     pub projects: Vec<Project>,
     #[serde(default = "default_scan_dirs")]
     pub scan_dirs: Vec<String>,
+    /// Default directory for pulling new projects into
+    #[serde(default = "default_pull_dir")]
+    pub default_pull_dir: String,
     #[serde(default)]
     pub auto_check_on_launch: bool,
 }
@@ -52,15 +58,46 @@ impl AppConfig {
             })
     }
 
-    /// Build the full rclone remote path for a project name
-    pub fn remote_path_for(&self, project_name: &str) -> String {
-        let rc = self.active_remote();
-        format!("{}:{}/{}", rc.name, rc.base_path, project_name)
+    /// Get a specific remote config by name
+    pub fn get_remote(&self, name: &str) -> RemoteConfig {
+        self.remotes
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .unwrap_or(RemoteConfig {
+                name: name.to_string(),
+                base_path: "proj".into(),
+            })
+    }
+
+    /// The default remote name (first in list)
+    pub fn default_remote_name(&self) -> String {
+        self.remotes.first().map(|r| r.name.clone()).unwrap_or_else(|| self.remote.clone())
+    }
+
+    /// Resolve which remote a project uses. Falls back to first remote if unset.
+    pub fn project_remote(&self, project: &Project) -> RemoteConfig {
+        let name = if project.remote.is_empty() {
+            self.default_remote_name()
+        } else {
+            project.remote.clone()
+        };
+        self.get_remote(&name)
+    }
+
+    /// Build the full rclone remote path for a project
+    pub fn remote_path_for_project(&self, project: &Project) -> String {
+        let rc = self.project_remote(project);
+        format!("{}:{}/{}", rc.name, rc.base_path, project.name)
     }
 }
 
 fn default_scan_dirs() -> Vec<String> {
     vec!["~/projects".into()]
+}
+
+fn default_pull_dir() -> String {
+    "~/projects".into()
 }
 
 impl Default for AppConfig {
@@ -83,6 +120,7 @@ impl Default for AppConfig {
             projects: vec![],
             remotes: default_remotes(),
             scan_dirs: default_scan_dirs(),
+            default_pull_dir: default_pull_dir(),
             auto_check_on_launch: false,
         }
     }

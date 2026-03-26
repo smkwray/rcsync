@@ -56,9 +56,10 @@
     await load(name);
   }
 
-  function startPull(dir: RemoteDir) {
+  async function startPull(dir: RemoteDir) {
     pullTarget = dir;
-    pullPath = dir.local_path || `~/projects/${dir.name}`;
+    const cfg = await invoke<{ default_pull_dir: string }>("get_config");
+    pullPath = dir.local_path || `${cfg.default_pull_dir}/${dir.name}`;
     showPullConfirm = true;
   }
 

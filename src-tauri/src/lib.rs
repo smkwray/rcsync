@@ -11,6 +11,7 @@ struct ProjectStatus {
     name: String,
     local_path: String,
     remote_path: String,
+    remote: String,
     exists_locally: bool,
 }
 
@@ -25,14 +26,18 @@ fn get_projects_status() -> Vec<ProjectStatus> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
 
+    let default_remote = cfg.default_remote_name();
+
     for p in &cfg.projects {
         seen.insert(p.name.clone());
         let expanded = expand_tilde(&p.local_path);
         if Path::new(&expanded).exists() {
+            let remote = if p.remote.is_empty() { default_remote.clone() } else { p.remote.clone() };
             result.push(ProjectStatus {
                 name: p.name.clone(),
                 local_path: p.local_path.clone(),
                 remote_path: p.remote_path.clone(),
+                remote,
                 exists_locally: true,
             });
         }
@@ -53,6 +58,7 @@ fn get_projects_status() -> Vec<ProjectStatus> {
                             name: name.to_string(),
                             local_path: format!("{}/{}", dir, name),
                             remote_path: format!("proj/{}", name),
+                            remote: default_remote.clone(),
                             exists_locally: true,
                         });
                     }
@@ -236,6 +242,7 @@ async fn pull_new_project(name: String, local_path: String) -> Result<String, St
         name: name.clone(),
         local_path: local_path.clone(),
         remote_path: format!("proj/{name}"),
+        remote: cfg.remote.clone(), // Use the active remote at time of pull
     };
 
     let cfg2 = cfg.clone();
@@ -260,15 +267,29 @@ fn find_project(cfg: &AppConfig, name: &str) -> Result<Project, String> {
             name: name.to_string(),
             local_path,
             remote_path: format!("proj/{}", name),
+            remote: cfg.default_remote_name(),
         });
     }
     Err(format!("Project '{}' not found", name))
+}
+
+/// Find project, but override its remote with a specific one
+fn find_project_with_remote(cfg: &AppConfig, name: &str, remote: &str) -> Result<Project, String> {
+    let mut p = find_project(cfg, name)?;
+    if !remote.is_empty() {
+        p.remote = remote.to_string();
+    }
+    Ok(p)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_projects_status,

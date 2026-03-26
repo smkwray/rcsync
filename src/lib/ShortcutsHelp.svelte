@@ -21,6 +21,7 @@
         ["f", "Bi-Sync"],
         ["g", "Pull"],
         ["h", "Delete local"],
+        ["i", "Pin / unpin"],
       ],
     },
     {
