@@ -1,0 +1,130 @@
+:root,
+[data-theme="dark"] {
+  --bg: #0f1117;
+  --bg-card: #1a1d27;
+  --bg-hover: #222632;
+  --bg-input: #13151d;
+  --border: #2a2e3a;
+  --text: #e4e6ed;
+  --text-muted: #8b8fa3;
+  --accent: #6c8cff;
+  --accent-hover: #8aa4ff;
+  --green: #4ade80;
+  --green-dim: #16382a;
+  --red: #f87171;
+  --red-dim: #3b1c1c;
+  --yellow: #facc15;
+  --yellow-dim: #35300f;
+  --font-mono: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --radius: 8px;
+}
+
+[data-theme="light"] {
+  --bg: #f5f6f8;
+  --bg-card: #ffffff;
+  --bg-hover: #ebedf2;
+  --bg-input: #f0f1f4;
+  --border: #d4d7e0;
+  --text: #1a1d27;
+  --text-muted: #6b7085;
+  --accent: #4a6cf7;
+  --accent-hover: #3958d9;
+  --green: #16a34a;
+  --green-dim: #dcfce7;
+  --red: #dc2626;
+  --red-dim: #fee2e2;
+  --yellow: #ca8a04;
+  --yellow-dim: #fef9c3;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  height: 100vh;
+}
+
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+button {
+  font-family: var(--font-sans);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+button:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
+}
+
+button.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+button.danger:hover {
+  background: var(--red-dim);
+}
+
+input, textarea {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 8px 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+input:focus, textarea:focus {
+  border-color: var(--accent);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}

@@ -1,0 +1,20 @@
+# Rust
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+
+# macOS
+.DS_Store
+._*
+
+# Build artifacts
+*.dmg
+
+# Config (contains user-specific paths)
+rcsync-config.json
+
+# Generated icons source
+app-icon-square.png
+Gemini_Generated_Image_*
