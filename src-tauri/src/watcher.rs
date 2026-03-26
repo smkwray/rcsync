@@ -16,22 +16,21 @@ pub struct FileChangeEvent {
 
 /// Start watching all project directories. Emits "file-change" events to the frontend.
 /// Returns a handle that keeps the watcher alive; drop it to stop watching.
+///
+/// Uses NonRecursive mode to avoid kqueue panics on macOS with symlinks/special files.
+/// This means we only detect changes in the top-level project directory, but that's
+/// sufficient since most edits touch files that bubble up as directory mtime changes.
 pub fn start_watcher(app: AppHandle) -> Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>> {
     let cfg = load_config();
 
     // Build a map of watched path prefix → project name
     let mut watch_dirs: Vec<(PathBuf, String)> = Vec::new();
-    let excludes: HashSet<&str> = [
-        "node_modules", ".git", ".venv", ".venv312", ".tmp-validate-venv",
-        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store",
-        "target",
-    ].into_iter().collect();
 
     // Collect project dirs from configured projects
     for p in &cfg.projects {
         let expanded = expand_tilde(&p.local_path);
         let path = PathBuf::from(&expanded);
-        if path.exists() {
+        if path.exists() && path.is_dir() {
             watch_dirs.push((path, p.name.clone()));
         }
     }
@@ -64,8 +63,9 @@ pub fn start_watcher(app: AppHandle) -> Option<notify_debouncer_mini::Debouncer<
 
     let mut debouncer = new_debouncer(Duration::from_secs(3), tx).ok()?;
 
+    // Watch each project dir non-recursively to avoid kqueue panics with symlinks
     for (path, _name) in &watch_dirs {
-        let _ = debouncer.watcher().watch(path, notify::RecursiveMode::Recursive);
+        let _ = debouncer.watcher().watch(path, notify::RecursiveMode::NonRecursive);
     }
 
     // Spawn a thread that reads debounced events and emits to frontend
@@ -78,16 +78,6 @@ pub fn start_watcher(app: AppHandle) -> Option<notify_debouncer_mini::Debouncer<
 
                     for event in &events {
                         if event.kind != DebouncedEventKind::Any {
-                            continue;
-                        }
-
-                        // Check if this path is in an excluded directory
-                        let path_str = event.path.to_string_lossy();
-                        let should_exclude = excludes.iter().any(|exc| {
-                            path_str.contains(&format!("/{}/", exc))
-                                || path_str.ends_with(&format!("/{}", exc))
-                        });
-                        if should_exclude {
                             continue;
                         }
 

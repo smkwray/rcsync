@@ -320,6 +320,7 @@ fn find_project_with_remote(cfg: &AppConfig, name: &str, remote: &str) -> Result
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
@@ -343,11 +344,13 @@ pub fn run() {
             pull_new_project,
         ])
         .setup(|app| {
-            // Start file watcher — keep the handle alive for the app's lifetime
+            // Start file watcher — keep the handle alive for the app's lifetime.
+            // Wrapped in catch_unwind so a watcher failure never crashes the app.
             let handle = app.handle().clone();
-            let _watcher = watcher::start_watcher(handle);
-            // Leak the watcher so it lives as long as the app
-            if let Some(w) = _watcher {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher::start_watcher(handle)
+            }));
+            if let Ok(Some(w)) = result {
                 std::mem::forget(w);
             }
             Ok(())
