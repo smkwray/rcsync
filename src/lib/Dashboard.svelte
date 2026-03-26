@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import type { AppConfig, Project, ProjectStatus, SyncMode } from "./types";
   import ProjectCard from "./ProjectCard.svelte";
   import LogOutput from "./LogOutput.svelte";
@@ -233,6 +234,15 @@
   }
 
   async function handlePushAll() {
+    const count = localProjects.length;
+    const ok = await customConfirm(
+      `Push All (${count} projects)?`,
+      `This will push all ${count} local projects to their remotes.\nLocal is authoritative — remote files will be overwritten.`,
+      "Push All",
+      false,
+    );
+    if (!ok) return;
+
     pushingAll = true;
     for (const p of localProjects) markRunning(p.name, "push");
     logLines = [...logLines, "--- PUSH ALL ---"];
@@ -303,6 +313,18 @@
   }
 
   loadProjects();
+
+  // Listen for local file changes from the watcher and invalidate sync status
+  listen<{ projects: string[] }>("file-change", (event) => {
+    const changed = event.payload.projects;
+    const updated = { ...checkStatuses };
+    for (const name of changed) {
+      if (updated[name]?.synced) {
+        updated[name] = { ...updated[name], synced: false, diffs: -1 };
+      }
+    }
+    checkStatuses = updated;
+  });
 </script>
 
 <svelte:window onkeydown={handleKeydown} />

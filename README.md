@@ -24,8 +24,10 @@
 - **Check** which files differ between local and remote
 - **Pull** or **Bi-Sync** when needed (with safety confirmations)
 - **Auto-discover** local projects by scanning directories
+- **File watching** — detects local changes and marks projects as "modified"
 - **Multi-remote** support — switch between cloud drives with pill tabs
 - **Keyboard-driven** — vim-style navigation, single-key actions
+- **Pin projects** to the top of the dashboard (persists across sessions)
 - **Portable config** — syncs between devices via Syncthing or similar
 
 ### Design philosophy
@@ -112,7 +114,27 @@ npx tauri dev
 
 ## Configuration
 
-rcsync stores its config as `rcsync-config.json` next to the app binary (portable). Example:
+rcsync uses two config files:
+
+### `defaults.json` (public, ships with the app)
+
+Contains exclude patterns and default scan directories. Safe to check into version control and share across devices.
+
+```json
+{
+  "excludes": [
+    "node_modules/**", ".git/**", ".venv/**",
+    "__pycache__/**", "src-tauri/target/**",
+    ".DS_Store", "._*"
+  ],
+  "scan_dirs": ["~/projects"],
+  "default_pull_dir": "~/projects"
+}
+```
+
+### `rcsync-config.json` (private, gitignored)
+
+User-specific settings — remotes, projects, paths. Stored next to the app binary (portable) so it can sync between devices via Syncthing.
 
 ```json
 {
@@ -122,26 +144,25 @@ rcsync stores its config as `rcsync-config.json` next to the app binary (portabl
     { "name": "gdrive", "base_path": "proj" },
     { "name": "onedrive", "base_path": "Projects" }
   ],
-  "excludes": [
-    "node_modules/**", ".git/**", ".venv/**",
-    "__pycache__/**", "target/**", "dist/**",
-    ".DS_Store", "._*"
-  ],
+  "extra_excludes": ["dist/**", "*.log"],
   "scan_dirs": ["~/projects", "~/code"],
   "projects": [],
   "auto_check_on_launch": false
 }
 ```
 
+Default excludes are always applied. `extra_excludes` adds your own patterns on top — both are shown in Settings, but defaults can't be removed from the UI.
+
 ### Key settings
 
-| Setting | Description |
-|---|---|
-| `remote` | Active remote name |
-| `remotes` | Available remotes with their base paths |
-| `scan_dirs` | Local directories to scan for project folders |
-| `excludes` | Glob patterns to skip during sync |
-| `auto_check_on_launch` | Run Check All when the app opens |
+| Setting | File | Description |
+|---|---|---|
+| `excludes` | defaults.json | Base exclude patterns (shared) |
+| `extra_excludes` | rcsync-config.json | Additional user excludes (merged with defaults) |
+| `remote` | rcsync-config.json | Active remote name |
+| `remotes` | rcsync-config.json | Available remotes with their base paths |
+| `scan_dirs` | rcsync-config.json | Local directories to scan for project folders |
+| `auto_check_on_launch` | rcsync-config.json | Run Check All when the app opens |
 
 ### Adding a new remote
 

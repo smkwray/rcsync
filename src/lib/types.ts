@@ -13,7 +13,12 @@ export interface RemoteConfig {
 export interface AppConfig {
   rclone_path: string;
   remote: string;
+  /** Combined excludes: defaults + user extras */
   excludes: string[];
+  /** Excludes from defaults.json (read-only in UI) */
+  default_excludes: string[];
+  /** User-added excludes only (editable in UI) */
+  extra_excludes: string[];
   remotes: RemoteConfig[];
   projects: Project[];
   scan_dirs: string[];

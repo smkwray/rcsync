@@ -33,7 +33,7 @@
   }
 </script>
 
-<div class="card" class:running class:synced={checkStatus?.synced} class:unsynced={checkStatus && !checkStatus.synced}>
+<div class="card" class:running class:synced={checkStatus?.synced} class:unsynced={checkStatus && !checkStatus.synced && checkStatus.diffs !== -1} class:modified={checkStatus?.diffs === -1}>
   <div class="card-header">
     <div class="name-row">
       <button class="pin-btn" class:pinned title={pinned ? "Unpin" : "Pin to top"} onclick={() => onpin(project)}>
@@ -50,6 +50,8 @@
         <div class="check-info">
           {#if checkStatus.synced}
             <span class="badge synced-badge">synced</span>
+          {:else if checkStatus.diffs === -1}
+            <span class="badge modified-badge">modified</span>
           {:else}
             <span class="badge unsynced-badge">{checkStatus.diffs} diff{checkStatus.diffs !== 1 ? "s" : ""}</span>
           {/if}
@@ -91,6 +93,7 @@
   .card.running { border-color: var(--yellow); }
   .card.synced { border-left: 3px solid var(--green); }
   .card.unsynced { border-left: 3px solid var(--yellow); }
+  .card.modified { border-left: 3px solid var(--orange, var(--yellow)); }
 
   .card-header {
     display: flex;
@@ -137,6 +140,7 @@
   .running-badge { background: var(--yellow-dim); color: var(--yellow); }
   .synced-badge { background: var(--green-dim); color: var(--green); }
   .unsynced-badge { background: var(--yellow-dim); color: var(--yellow); }
+  .modified-badge { background: var(--yellow-dim); color: var(--yellow); font-style: italic; }
 
   .check-time {
     font-size: 10px;

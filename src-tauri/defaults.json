@@ -1,0 +1,20 @@
+{
+  "excludes": [
+    "node_modules/**",
+    ".git/**",
+    ".venv/**",
+    ".venv312/**",
+    ".tmp-validate-venv/**",
+    "src-tauri/target/**",
+    "__pycache__/**",
+    ".pytest_cache/**",
+    ".mypy_cache/**",
+    ".ruff_cache/**",
+    ".DS_Store",
+    "._*"
+  ],
+  "scan_dirs": [
+    "~/projects"
+  ],
+  "default_pull_dir": "~/projects"
+}

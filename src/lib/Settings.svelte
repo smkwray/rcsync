@@ -48,14 +48,17 @@
 
   function addExclude() {
     const val = newExclude.trim();
-    if (val && !editConfig.excludes.includes(val)) {
+    if (val && !editConfig.excludes.includes(val) && !editConfig.extra_excludes.includes(val)) {
+      editConfig.extra_excludes = [...editConfig.extra_excludes, val];
       editConfig.excludes = [...editConfig.excludes, val];
       newExclude = "";
     }
   }
 
   function removeExclude(idx: number) {
-    editConfig.excludes = editConfig.excludes.filter((_, i) => i !== idx);
+    const val = editConfig.extra_excludes[idx];
+    editConfig.extra_excludes = editConfig.extra_excludes.filter((_, i) => i !== idx);
+    editConfig.excludes = editConfig.excludes.filter((e) => e !== val);
   }
 
   function addProject() {
@@ -139,8 +142,17 @@
 
       <section>
         <h3>Excludes</h3>
+        <p class="section-desc">
+          Default excludes come from defaults.json and are shared across devices. Add your own below.
+        </p>
         <div class="exclude-list">
-          {#each editConfig.excludes as exc, i}
+          {#each editConfig.default_excludes as exc}
+            <div class="exclude-item default">
+              <code>{exc}</code>
+              <span class="badge">default</span>
+            </div>
+          {/each}
+          {#each editConfig.extra_excludes as exc, i}
             <div class="exclude-item">
               <code>{exc}</code>
               <button class="small danger" onclick={() => removeExclude(i)}>x</button>
@@ -203,9 +215,11 @@
     border: 1px solid var(--border);
     border-radius: 12px;
     width: 600px;
+    max-width: 90vw;
     max-height: 80vh;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
   }
 
   .settings-header {
@@ -224,6 +238,7 @@
   .settings-body {
     padding: 20px;
     overflow-y: auto;
+    overflow-x: hidden;
     flex: 1;
   }
 
@@ -323,6 +338,21 @@
     font-size: 11px;
   }
 
+  .exclude-item.default {
+    opacity: 0.7;
+  }
+
+  .badge {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+
   .add-row {
     display: flex;
     gap: 8px;
@@ -360,15 +390,28 @@
     font-size: 11px;
     color: var(--text-muted);
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .add-project {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 6px;
   }
 
   .add-project input {
-    flex: 1;
+    min-width: 0;
+  }
+
+  .add-project input:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .add-project button {
+    grid-column: 1 / -1;
   }
 
   button.small {

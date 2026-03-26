@@ -1,5 +1,6 @@
 mod config;
 mod rclone;
+mod watcher;
 
 use config::{expand_tilde, load_config, save_config, AppConfig, Project, RemoteConfig};
 use rclone::{bisync_project, check_project, list_remote, local_dir_has_content, sync_project, RemoteDir};
@@ -307,6 +308,16 @@ pub fn run() {
             check_local_exists,
             pull_new_project,
         ])
+        .setup(|app| {
+            // Start file watcher — keep the handle alive for the app's lifetime
+            let handle = app.handle().clone();
+            let _watcher = watcher::start_watcher(handle);
+            // Leak the watcher so it lives as long as the app
+            if let Some(w) = _watcher {
+                std::mem::forget(w);
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

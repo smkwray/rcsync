@@ -19,6 +19,49 @@ pub struct RemoteConfig {
     pub base_path: String,
 }
 
+/// Public defaults — shipped with the app, checked into git.
+/// Lives at `defaults.json` next to the executable or in the project root.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Defaults {
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
+    pub scan_dirs: Vec<String>,
+    #[serde(default)]
+    pub default_pull_dir: String,
+}
+
+/// Private user config — gitignored, contains user-specific settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserConfig {
+    #[serde(default = "default_rclone_path")]
+    pub rclone_path: String,
+    #[serde(default = "default_remote")]
+    pub remote: String,
+    #[serde(default = "default_remotes")]
+    pub remotes: Vec<RemoteConfig>,
+    #[serde(default)]
+    pub projects: Vec<Project>,
+    #[serde(default)]
+    pub scan_dirs: Vec<String>,
+    #[serde(default)]
+    pub default_pull_dir: String,
+    #[serde(default)]
+    pub auto_check_on_launch: bool,
+    /// User-added excludes (merged with defaults, not replacing them)
+    #[serde(default)]
+    pub extra_excludes: Vec<String>,
+}
+
+fn default_rclone_path() -> String {
+    "rclone".into()
+}
+
+fn default_remote() -> String {
+    "gdrive".into()
+}
+
+/// The merged config exposed to the rest of the app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub rclone_path: String,
@@ -27,7 +70,12 @@ pub struct AppConfig {
     /// Available remotes
     #[serde(default = "default_remotes")]
     pub remotes: Vec<RemoteConfig>,
+    /// Combined excludes: defaults + user extras
     pub excludes: Vec<String>,
+    /// Which excludes come from defaults (so the UI can mark them)
+    pub default_excludes: Vec<String>,
+    /// User-added excludes only
+    pub extra_excludes: Vec<String>,
     pub projects: Vec<Project>,
     #[serde(default = "default_scan_dirs")]
     pub scan_dirs: Vec<String>,
@@ -100,35 +148,93 @@ fn default_pull_dir() -> String {
     "~/projects".into()
 }
 
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            rclone_path: default_rclone_path(),
+            remote: default_remote(),
+            remotes: default_remotes(),
+            projects: vec![],
+            scan_dirs: vec![],
+            default_pull_dir: String::new(),
+            auto_check_on_launch: false,
+            extra_excludes: vec![],
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
+        let defaults = load_defaults();
         Self {
             rclone_path: "rclone".into(),
             remote: "gdrive".into(),
-            excludes: vec![
-                "node_modules/**".into(),
-                ".git/**".into(),
-                ".venv/**".into(),
-                ".venv312/**".into(),
-                ".tmp-validate-venv/**".into(),
-                "__pycache__/**".into(),
-                ".pytest_cache/**".into(),
-                ".mypy_cache/**".into(),
-                ".DS_Store".into(),
-                "._*".into(),
-            ],
+            excludes: defaults.excludes.clone(),
+            default_excludes: defaults.excludes.clone(),
+            extra_excludes: vec![],
             projects: vec![],
             remotes: default_remotes(),
-            scan_dirs: default_scan_dirs(),
-            default_pull_dir: default_pull_dir(),
+            scan_dirs: if defaults.scan_dirs.is_empty() {
+                default_scan_dirs()
+            } else {
+                defaults.scan_dirs
+            },
+            default_pull_dir: if defaults.default_pull_dir.is_empty() {
+                default_pull_dir()
+            } else {
+                defaults.default_pull_dir
+            },
             auto_check_on_launch: false,
         }
     }
 }
 
-/// Portable config: lives next to the executable (or in the project dir via
-/// the RCSYNC_CONFIG env var) so it syncs between devices with Syncthing.
-/// Resolution order:
+/// Resolve the directory next to the executable (climbing out of .app bundles on macOS).
+fn exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    // Detect .app bundle: climb out of Contents/MacOS
+    if dir.ends_with("MacOS") {
+        if let Some(contents) = dir.parent() {
+            if let Some(app_bundle) = contents.parent() {
+                if let Some(app_parent) = app_bundle.parent() {
+                    dir = app_parent.to_path_buf();
+                }
+            }
+        }
+    }
+    Some(dir)
+}
+
+/// Load the public defaults file. Searched in order:
+///   1. $RCSYNC_DEFAULTS env var
+///   2. Next to the executable / .app bundle
+///   3. Embedded fallback (compiled-in)
+fn load_defaults() -> Defaults {
+    // 1. Env var override
+    if let Ok(p) = std::env::var("RCSYNC_DEFAULTS") {
+        if let Ok(contents) = fs::read_to_string(&p) {
+            if let Ok(d) = serde_json::from_str(&contents) {
+                return d;
+            }
+        }
+    }
+
+    // 2. Next to executable
+    if let Some(dir) = exe_dir() {
+        let path = dir.join("defaults.json");
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Ok(d) = serde_json::from_str(&contents) {
+                return d;
+            }
+        }
+    }
+
+    // 3. Compiled-in fallback
+    serde_json::from_str(include_str!("../defaults.json")).unwrap_or_default()
+}
+
+/// Portable user config path. Resolution order:
 ///   1. $RCSYNC_CONFIG (explicit override)
 ///   2. Next to the running executable (portable — works when app is in a synced folder)
 ///   3. Fallback: platform config dir
@@ -139,24 +245,7 @@ fn config_path() -> PathBuf {
     }
 
     // 2. Next to executable
-    if let Ok(exe) = std::env::current_exe() {
-        // On macOS the exe is inside .app/Contents/MacOS/ — walk up to the .app's parent
-        let mut dir = exe
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-
-        // Detect .app bundle: climb out of Contents/MacOS
-        if dir.ends_with("MacOS") {
-            if let Some(contents) = dir.parent() {
-                if let Some(app_bundle) = contents.parent() {
-                    if let Some(app_parent) = app_bundle.parent() {
-                        dir = app_parent.to_path_buf();
-                    }
-                }
-            }
-        }
-
+    if let Some(dir) = exe_dir() {
         let portable = dir.join("rcsync-config.json");
         if portable.exists() || !platform_config_path().exists() {
             return portable;
@@ -175,21 +264,71 @@ fn platform_config_path() -> PathBuf {
     p
 }
 
+/// Load and merge: defaults (public) + user config (private) → AppConfig.
 pub fn load_config() -> AppConfig {
-    let path = config_path();
-    match fs::read_to_string(&path) {
+    let defaults = load_defaults();
+    let user: UserConfig = match fs::read_to_string(config_path()) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-        Err(_) => {
-            let cfg = AppConfig::default();
-            save_config(&cfg).ok();
-            cfg
+        Err(_) => UserConfig::default(),
+    };
+
+    // Merge excludes: defaults + user extras (deduplicated)
+    let mut excludes = defaults.excludes.clone();
+    for ex in &user.extra_excludes {
+        if !excludes.contains(ex) {
+            excludes.push(ex.clone());
         }
+    }
+
+    // User scan_dirs override defaults if non-empty
+    let scan_dirs = if user.scan_dirs.is_empty() {
+        if defaults.scan_dirs.is_empty() {
+            default_scan_dirs()
+        } else {
+            defaults.scan_dirs.clone()
+        }
+    } else {
+        user.scan_dirs
+    };
+
+    let default_pull_dir = if user.default_pull_dir.is_empty() {
+        if defaults.default_pull_dir.is_empty() {
+            default_pull_dir()
+        } else {
+            defaults.default_pull_dir.clone()
+        }
+    } else {
+        user.default_pull_dir
+    };
+
+    AppConfig {
+        rclone_path: user.rclone_path,
+        remote: user.remote,
+        remotes: user.remotes,
+        excludes,
+        default_excludes: defaults.excludes,
+        extra_excludes: user.extra_excludes,
+        projects: user.projects,
+        scan_dirs,
+        default_pull_dir,
+        auto_check_on_launch: user.auto_check_on_launch,
     }
 }
 
+/// Save only the private user config. Defaults are never written by the app.
 pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
+    let user = UserConfig {
+        rclone_path: cfg.rclone_path.clone(),
+        remote: cfg.remote.clone(),
+        remotes: cfg.remotes.clone(),
+        projects: cfg.projects.clone(),
+        scan_dirs: cfg.scan_dirs.clone(),
+        default_pull_dir: cfg.default_pull_dir.clone(),
+        auto_check_on_launch: cfg.auto_check_on_launch,
+        extra_excludes: cfg.extra_excludes.clone(),
+    };
     let path = config_path();
-    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&user).map_err(|e| e.to_string())?;
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
