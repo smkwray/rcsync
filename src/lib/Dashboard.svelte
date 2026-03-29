@@ -139,6 +139,10 @@
   }
 
   async function handleAction(project: Project, mode: SyncMode) {
+    if (runningProjects.has(project.name)) {
+      logLines = [...logLines, `[${project.name}] Skipped — ${runningProjects.get(project.name)} already in progress.`];
+      return;
+    }
     if (mode === "pull") {
       const ok = await customConfirm(
         `Pull "${project.name}"?`,
@@ -213,6 +217,7 @@
     const queue = [...localProjects];
 
     async function checkOne(ps: ProjectStatus) {
+      if (runningProjects.has(ps.name)) return;
       markRunning(ps.name, "check");
       try {
         const result = await invoke<string>("check", { projectName: ps.name });

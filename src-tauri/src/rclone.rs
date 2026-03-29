@@ -160,11 +160,15 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<String, Strin
         result.push_str(&format!("{} differences, {} matching.\n", diff_count, match_count));
     }
 
-    if code == 0 || code == 1 {
-        Ok(result)
-    } else {
-        Err(format!("{}\nExited with code {}", result, code))
+    // code 0 = all match, code 1 = differences found (both normal)
+    // code 2+ = errors during check — still return results, but append a warning
+    if code > 1 {
+        result.push_str(&format!(
+            "(rclone exited with code {} — some files may not have been checked)\n",
+            code
+        ));
     }
+    Ok(result)
 }
 
 /// List remote projects. If `remote_name` is provided, use that remote; otherwise use active.

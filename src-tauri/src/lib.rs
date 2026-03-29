@@ -6,6 +6,14 @@ use config::{expand_tilde, load_config, save_config, AppConfig, Project, RemoteC
 use rclone::{bisync_project, check_project, list_remote, local_dir_has_content, sync_project, RemoteDir};
 use serde::Serialize;
 use std::path::Path;
+use std::sync::OnceLock;
+use tokio::sync::Semaphore;
+
+/// Limit concurrent rclone processes to avoid overwhelming the remote or OS.
+fn rclone_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(6))
+}
 
 #[derive(Clone, Serialize)]
 struct ProjectStatus {
@@ -83,6 +91,7 @@ fn update_config(cfg: AppConfig) -> Result<(), String> {
 async fn push(project_name: String, dry_run: bool) -> Result<String, String> {
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
+    let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || sync_project(&cfg2, &proj2, "push", dry_run))
@@ -94,6 +103,7 @@ async fn push(project_name: String, dry_run: bool) -> Result<String, String> {
 async fn pull(project_name: String, dry_run: bool) -> Result<String, String> {
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
+    let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || sync_project(&cfg2, &proj2, "pull", dry_run))
@@ -105,6 +115,7 @@ async fn pull(project_name: String, dry_run: bool) -> Result<String, String> {
 async fn check(project_name: String) -> Result<String, String> {
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
+    let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || check_project(&cfg2, &proj2))
@@ -116,6 +127,7 @@ async fn check(project_name: String) -> Result<String, String> {
 async fn bisync(project_name: String) -> Result<String, String> {
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
+    let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2))
@@ -134,6 +146,7 @@ async fn push_all(dry_run: bool) -> Result<String, String> {
         if !Path::new(&expanded).exists() {
             continue;
         }
+        let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
         let cfg2 = cfg.clone();
         let proj2 = project.clone();
         match tokio::task::spawn_blocking(move || sync_project(&cfg2, &proj2, "push", dry_run))
@@ -169,6 +182,7 @@ async fn bisync_all() -> Result<String, String> {
             Ok(p) => p,
             Err(_) => continue,
         };
+        let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
         let cfg2 = cfg.clone();
         let proj2 = project.clone();
         match tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2)).await {
@@ -202,6 +216,7 @@ async fn check_all() -> Result<std::collections::HashMap<String, String>, String
             Ok(p) => p,
             Err(_) => continue,
         };
+        let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
         let cfg2 = cfg.clone();
         let proj2 = project.clone();
         let name = ps.name.clone();
@@ -231,6 +246,7 @@ fn delete_local(project_name: String) -> Result<(), String> {
 #[tauri::command]
 async fn browse_remote(remote_name: Option<String>) -> Result<Vec<RemoteDir>, String> {
     let cfg = load_config();
+    let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
     let rn = remote_name;
     tokio::task::spawn_blocking(move || list_remote(&cfg, rn.as_deref()))
         .await
@@ -279,6 +295,7 @@ async fn pull_new_project(name: String, local_path: String) -> Result<String, St
         remote: cfg.remote.clone(), // Use the active remote at time of pull
     };
 
+    let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     let output =
