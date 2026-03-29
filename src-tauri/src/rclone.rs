@@ -33,15 +33,56 @@ fn resolve_rclone(cfg: &AppConfig) -> String {
     if Path::new(p).is_absolute() {
         return p.clone();
     }
-    for candidate in &[
-        "/opt/homebrew/bin/rclone",
-        "/usr/local/bin/rclone",
-        "/usr/bin/rclone",
-    ] {
-        if Path::new(candidate).exists() {
-            return candidate.to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        for candidate in &[
+            "/opt/homebrew/bin/rclone",
+            "/usr/local/bin/rclone",
+            "/usr/bin/rclone",
+        ] {
+            if Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
         }
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Check common Windows install locations
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            let candidate = format!("{}\\rclone\\rclone.exe", program_files);
+            if Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let candidate = format!("{}\\rclone\\rclone.exe", local_app_data);
+            if Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+        // Also check scoop and chocolatey common paths via HOME
+        if let Some(home) = dirs::home_dir() {
+            let scoop = home.join("scoop\\shims\\rclone.exe");
+            if scoop.exists() {
+                return scoop.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for candidate in &[
+            "/usr/local/bin/rclone",
+            "/usr/bin/rclone",
+        ] {
+            if Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+    }
+
     p.clone()
 }
 

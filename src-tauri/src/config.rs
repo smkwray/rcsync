@@ -234,33 +234,55 @@ fn load_defaults() -> Defaults {
     serde_json::from_str(include_str!("../defaults.json")).unwrap_or_default()
 }
 
+/// Get the machine hostname, lowercased and sanitised for use in filenames.
+pub fn machine_name() -> String {
+    std::env::var("RCSYNC_MACHINE")
+        .or_else(|_| hostname::get()
+            .map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|_| "default".into())
+        .to_lowercase()
+}
+
 /// Portable user config path. Resolution order:
 ///   1. $RCSYNC_CONFIG (explicit override)
-///   2. Next to the running executable (portable — works when app is in a synced folder)
-///   3. Fallback: platform config dir
+///   2. Machine-specific file next to the executable: `rcsync-config-{hostname}.json`
+///      Falls back to the legacy `rcsync-config.json` if the host file doesn't exist
+///      but the legacy one does (smooth migration for existing setups).
+///   3. Fallback: platform config dir (also machine-specific)
 fn config_path() -> PathBuf {
     // 1. Env var override
     if let Ok(p) = std::env::var("RCSYNC_CONFIG") {
         return PathBuf::from(p);
     }
 
-    // 2. Next to executable
+    let host = machine_name();
+
+    // 2. Next to executable (portable — works when app is in a synced folder)
     if let Some(dir) = exe_dir() {
-        let portable = dir.join("rcsync-config.json");
-        if portable.exists() || !platform_config_path().exists() {
-            return portable;
+        let host_file = dir.join(format!("rcsync-config-{}.json", host));
+        if host_file.exists() {
+            return host_file;
+        }
+        // Legacy fallback: existing rcsync-config.json (pre-hostname era)
+        let legacy = dir.join("rcsync-config.json");
+        if legacy.exists() {
+            return legacy;
+        }
+        // New install: use host-specific file
+        if !platform_config_path(&host).exists() {
+            return host_file;
         }
     }
 
     // 3. Platform fallback
-    platform_config_path()
+    platform_config_path(&host)
 }
 
-fn platform_config_path() -> PathBuf {
+fn platform_config_path(host: &str) -> PathBuf {
     let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("rcsync");
     fs::create_dir_all(&p).ok();
-    p.push("config.json");
+    p.push(format!("config-{}.json", host));
     p
 }
 

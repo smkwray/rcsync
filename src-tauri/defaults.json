@@ -11,7 +11,9 @@
     ".mypy_cache/**",
     ".ruff_cache/**",
     ".DS_Store",
-    "._*"
+    "._*",
+    "Thumbs.db",
+    "desktop.ini"
   ],
   "scan_dirs": [
     "~/projects"

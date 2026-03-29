@@ -30,6 +30,11 @@ fn get_config() -> AppConfig {
 }
 
 #[tauri::command]
+fn get_machine_name() -> String {
+    config::machine_name()
+}
+
+#[tauri::command]
 fn get_projects_status() -> Vec<ProjectStatus> {
     let cfg = load_config();
     let mut seen = std::collections::HashSet::new();
@@ -344,6 +349,7 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_config,
+            get_machine_name,
             get_projects_status,
             update_config,
             push,
