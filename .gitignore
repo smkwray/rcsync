@@ -14,6 +14,10 @@ dist/
 
 # Config (contains user-specific paths)
 rcsync-config.json
+rcsync-config-*.json
+
+# Claude Code
+.claude/
 
 # Generated icons source
 app-icon-square.png

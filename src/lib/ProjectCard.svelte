@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
   import type { Project, SyncMode } from "./types";
 
   let {
@@ -20,6 +21,10 @@
     ondelete: (project: Project) => void;
     onpin: (project: Project) => void;
   } = $props();
+
+  function openFolder() {
+    invoke("open_folder", { localPath: project.local_path });
+  }
 
   function runLabel(): string {
     switch (runningMode) {
@@ -58,6 +63,11 @@
           <span class="check-time">{checkStatus.time}</span>
         </div>
       {/if}
+      <button class="icon-btn" title="Open in file manager" onclick={openFolder}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
       <button class="trash-btn" title="Delete local copy" onclick={() => ondelete(project)}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -148,7 +158,7 @@
     font-family: var(--font-mono);
   }
 
-  .trash-btn {
+  .icon-btn, .trash-btn {
     padding: 3px 5px;
     border: none;
     background: transparent;
@@ -157,6 +167,7 @@
     opacity: 0.4;
     transition: opacity 0.15s, color 0.15s;
   }
+  .icon-btn:hover { opacity: 1; color: var(--accent); background: transparent; border: none; }
   .trash-btn:hover { opacity: 1; color: var(--red); background: transparent; border: none; }
 
   .paths { margin-bottom: 10px; }

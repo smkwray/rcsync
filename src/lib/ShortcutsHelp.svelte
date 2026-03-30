@@ -20,6 +20,7 @@
         ["d", "Check"],
         ["f", "Bi-Sync"],
         ["g", "Pull"],
+        ["e", "Open folder"],
         ["h", "Delete local"],
         ["i", "Pin / unpin"],
       ],

@@ -2821,6 +2821,7 @@ version = "0.1.0"
 dependencies = [
  "dirs 6.0.0",
  "hostname",
+ "libc",
  "notify",
  "notify-debouncer-mini",
  "serde",

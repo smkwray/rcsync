@@ -9,10 +9,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
-/// Limit concurrent rclone processes to avoid overwhelming the remote or OS.
+/// Limit concurrent rclone processes to avoid overwhelming the remote or
+/// exhausting file descriptors (macOS default ulimit is 256).
 fn rclone_semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
-    SEM.get_or_init(|| Semaphore::new(6))
+    SEM.get_or_init(|| Semaphore::new(3))
 }
 
 #[derive(Clone, Serialize)]
@@ -314,6 +315,22 @@ async fn pull_new_project(name: String, local_path: String) -> Result<String, St
     Ok(output)
 }
 
+#[tauri::command]
+fn open_folder(local_path: String) -> Result<(), String> {
+    let expanded = expand_tilde(&local_path);
+    let path = Path::new(&expanded);
+    if !path.exists() {
+        return Err(format!("Directory does not exist: {}", expanded));
+    }
+    #[cfg(target_os = "macos")]
+    { std::process::Command::new("open").arg(&expanded).spawn().map_err(|e| e.to_string())?; }
+    #[cfg(target_os = "windows")]
+    { std::process::Command::new("explorer").arg(&expanded).spawn().map_err(|e| e.to_string())?; }
+    #[cfg(target_os = "linux")]
+    { std::process::Command::new("xdg-open").arg(&expanded).spawn().map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
 fn find_project(cfg: &AppConfig, name: &str) -> Result<Project, String> {
     if let Some(p) = cfg.projects.iter().find(|p| p.name == name) {
         return Ok(p.clone());
@@ -338,8 +355,30 @@ fn find_project_with_remote(cfg: &AppConfig, name: &str, remote: &str) -> Result
     Ok(p)
 }
 
+/// Try to raise the open-file-descriptor soft limit so rclone processes
+/// don't hit "Too many open files" on macOS (default soft limit is 256).
+#[cfg(unix)]
+fn raise_fd_limit() {
+    use std::io;
+    let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+            let target = rlim.rlim_max.min(8192);
+            if rlim.rlim_cur < target {
+                rlim.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                    eprintln!("warning: setrlimit failed: {}", io::Error::last_os_error());
+                }
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(unix)]
+    raise_fd_limit();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
@@ -360,6 +399,7 @@ pub fn run() {
             bisync_all,
             check_all,
             delete_local,
+            open_folder,
             browse_remote,
             get_remotes,
             switch_remote,

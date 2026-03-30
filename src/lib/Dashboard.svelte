@@ -250,16 +250,32 @@
     if (!ok) return;
 
     pushingAll = true;
-    for (const p of localProjects) markRunning(p.name, "push");
     logLines = [...logLines, "--- PUSH ALL ---"];
-    try {
-      const result = await invoke<string>("push_all", { dryRun: false });
-      logLines = [...logLines, ...result.split("\n").filter((l) => l.trim())];
-    } catch (e) {
-      logLines = [...logLines, `[ERROR] ${e}`];
+
+    const CONCURRENCY = 3;
+    const queue = [...localProjects];
+
+    async function pushOne(ps: ProjectStatus) {
+      if (runningProjects.has(ps.name)) return;
+      markRunning(ps.name, "push");
+      try {
+        const result = await invoke<string>("push", { projectName: ps.name, dryRun: false });
+        if (result) addLog(ps.name, result);
+        logLines = [...logLines, `[${ps.name}] Done.`];
+        checkStatuses = { ...checkStatuses, [ps.name]: { time: shortTime(), synced: true, diffs: 0 } };
+      } catch (e) {
+        logLines = [...logLines, `[${ps.name}] ERROR: ${e}`];
+      }
+      markDone(ps.name);
     }
+
+    while (queue.length > 0) {
+      const batch = queue.splice(0, CONCURRENCY);
+      await Promise.all(batch.map(pushOne));
+    }
+
+    logLines = [...logLines, "Push all complete."];
     pushingAll = false;
-    runningProjects = new Map();
   }
 
   async function handleBisyncAll() {
@@ -272,16 +288,32 @@
     if (!ok) return;
 
     bisyncingAll = true;
-    for (const p of localProjects) markRunning(p.name, "bisync");
     logLines = [...logLines, "--- BI-SYNC ALL ---"];
-    try {
-      const result = await invoke<string>("bisync_all");
-      logLines = [...logLines, ...result.split("\n").filter((l) => l.trim())];
-    } catch (e) {
-      logLines = [...logLines, `[ERROR] ${e}`];
+
+    const CONCURRENCY = 3;
+    const queue = [...localProjects];
+
+    async function bisyncOne(ps: ProjectStatus) {
+      if (runningProjects.has(ps.name)) return;
+      markRunning(ps.name, "bisync");
+      try {
+        const result = await invoke<string>("bisync", { projectName: ps.name });
+        if (result) addLog(ps.name, result);
+        logLines = [...logLines, `[${ps.name}] Done.`];
+        checkStatuses = { ...checkStatuses, [ps.name]: { time: shortTime(), synced: true, diffs: 0 } };
+      } catch (e) {
+        logLines = [...logLines, `[${ps.name}] ERROR: ${e}`];
+      }
+      markDone(ps.name);
     }
+
+    while (queue.length > 0) {
+      const batch = queue.splice(0, CONCURRENCY);
+      await Promise.all(batch.map(bisyncOne));
+    }
+
+    logLines = [...logLines, "Bi-sync all complete."];
     bisyncingAll = false;
-    runningProjects = new Map();
   }
 
   function clearLog() { logLines = []; }
@@ -333,6 +365,7 @@
       case "f": { const s = ensureSelected(); if (s) handleAction(toProject(s), "bisync"); } break;
       case "g": { const s = ensureSelected(); if (s) handleAction(toProject(s), "pull"); } break;
       case "h": { const s = ensureSelected(); if (s) handleDelete(toProject(s)); } break;
+      case "e": { const s = ensureSelected(); if (s) invoke("open_folder", { localPath: s.local_path }); } break;
       case "i": { const s = ensureSelected(); if (s) togglePin(toProject(s)); } break;
       case "/": e.preventDefault(); filterInput?.focus(); break;
       case "c": if (!checkingAll) runCheckAll(); break;
@@ -400,7 +433,7 @@
         <p class="loading">No matches for "{search}"</p>
       {:else}
         {#each filteredProjects as project, i (project.name)}
-          <div class="card-wrapper" class:selected={shortcutsEnabled && i === selectedIndex}>
+          <div class="card-wrapper" class:selected={i === selectedIndex} onclick={() => selectedIndex = i}>
             <ProjectCard
               project={toProject(project)}
               running={runningProjects.has(project.name)}
@@ -470,7 +503,7 @@
   .log-meta { display: flex; gap: 8px; align-items: center; }
   .log-count { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
   .log-chevron { font-size: 10px; color: var(--text-muted); }
-  .log-body { flex: 1; overflow: hidden; animation: slideDown 0.2s ease; }
+  .log-body { flex: 1; overflow: auto; animation: slideDown 0.2s ease; }
   @keyframes slideDown { from { opacity: 0; max-height: 0; } to { opacity: 1; max-height: 280px; } }
   .loading { color: var(--text-muted); font-style: italic; }
   button.warn { border-color: var(--yellow); color: var(--yellow); }

@@ -29,8 +29,7 @@
     line-height: 1.6;
     overflow-y: auto;
     flex: 1;
-    min-height: 120px;
-    max-height: 300px;
+    min-height: 0;
   }
 
   .log-line {
