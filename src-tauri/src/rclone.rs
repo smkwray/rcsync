@@ -120,6 +120,16 @@ pub fn sync_project(
     };
     let remote = cfg.remote_path_for_project(project);
 
+    // Safety: refuse to push an empty local directory — rclone sync would
+    // wipe every file on the remote to match the empty source.
+    if mode == "push" && !local_dir_has_content(&local) {
+        return Err(format!(
+            "Refusing to push: local directory '{}' is empty or missing contents. \
+             This would delete all remote files for '{}'.",
+            local, project.name
+        ));
+    }
+
     let (src, dst) = match mode {
         "pull" => (remote, local),
         _ => (local, remote),
@@ -142,6 +152,17 @@ pub fn sync_project(
 
 pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, String> {
     let local = check_local_path(project)?;
+
+    // Safety: refuse to bisync an empty local directory — could propagate
+    // deletions to the remote.
+    if !local_dir_has_content(&local) {
+        return Err(format!(
+            "Refusing to bi-sync: local directory '{}' is empty or missing contents. \
+             This could delete remote files for '{}'.",
+            local, project.name
+        ));
+    }
+
     let remote = cfg.remote_path_for_project(project);
 
     let mut args = vec!["bisync".to_string(), local, remote];
@@ -250,11 +271,25 @@ pub fn list_remote(cfg: &AppConfig, remote_name: Option<&str>) -> Result<Vec<Rem
         .collect())
 }
 
+/// OS-generated files that rclone excludes by default.  A directory
+/// containing *only* these is effectively empty after sync, so we must
+/// not count them as real content.
+fn is_os_junk(name: &str) -> bool {
+    name == ".DS_Store"
+        || name == "Thumbs.db"
+        || name == "desktop.ini"
+        || name.starts_with("._")
+}
+
 pub fn local_dir_has_content(path: &str) -> bool {
     let expanded = expand_tilde(path);
     let p = Path::new(&expanded);
     p.exists()
         && p.read_dir()
-            .map(|mut entries| entries.next().is_some())
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| !is_os_junk(&e.file_name().to_string_lossy()))
+            })
             .unwrap_or(false)
 }

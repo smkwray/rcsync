@@ -235,10 +235,11 @@ async fn check_all() -> Result<std::collections::HashMap<String, String>, String
     Ok(results)
 }
 
-/// Delete local project directory. Does NOT affect remote.
+/// Delete local project directory AND remove it from config so a
+/// subsequent "push all" can never accidentally sync the now-empty path.
 #[tauri::command]
 fn delete_local(project_name: String) -> Result<(), String> {
-    let cfg = load_config();
+    let mut cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
     let expanded = expand_tilde(&project.local_path);
     let path = Path::new(&expanded);
@@ -246,7 +247,16 @@ fn delete_local(project_name: String) -> Result<(), String> {
         return Err("Local directory does not exist".into());
     }
     std::fs::remove_dir_all(path)
-        .map_err(|e| format!("Failed to delete {}: {}", expanded, e))
+        .map_err(|e| format!("Failed to delete {}: {}", expanded, e))?;
+
+    // Remove from config to prevent any future push of a recreated empty dir
+    let before = cfg.projects.len();
+    cfg.projects.retain(|p| p.name != project_name);
+    if cfg.projects.len() != before {
+        save_config(&cfg)
+            .map_err(|e| format!("Deleted locally but failed to update config: {e}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
