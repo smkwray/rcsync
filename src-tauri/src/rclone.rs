@@ -1,6 +1,19 @@
 use crate::config::{self, expand_tilde, find_local_path, AppConfig, Project};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::path::Path;
 use std::process::Command;
+
+fn rclone_command(program: &str) -> Command {
+    let cmd = Command::new(program);
+    #[cfg(windows)]
+    let cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = cmd;
+        c.creation_flags(0x08000000); // CREATE_NO_WINDOW — suppress console pop-up
+        c
+    };
+    cmd
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteDir {
@@ -15,6 +28,18 @@ fn build_exclude_args(cfg: &AppConfig) -> Vec<String> {
         .iter()
         .flat_map(|e| vec!["--exclude".to_string(), e.clone()])
         .collect()
+}
+
+fn build_exclude_set(cfg: &AppConfig) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in &cfg.excludes {
+        let glob = Glob::new(pattern)
+            .map_err(|e| format!("Invalid exclude pattern '{}': {}", pattern, e))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to compile exclude patterns: {}", e))
 }
 
 fn check_local_path(project: &Project) -> Result<String, String> {
@@ -89,7 +114,7 @@ fn resolve_rclone(cfg: &AppConfig) -> String {
 /// Run rclone and return combined stdout+stderr as a string.
 fn run_rclone(cfg: &AppConfig, args: &[String]) -> Result<(String, i32), String> {
     let rclone = resolve_rclone(cfg);
-    let output = Command::new(&rclone)
+    let output = rclone_command(&rclone)
         .args(args)
         .output()
         .map_err(|e| format!("Failed to start rclone at '{}': {}", rclone, e))?;
@@ -122,10 +147,10 @@ pub fn sync_project(
 
     // Safety: refuse to push an empty local directory — rclone sync would
     // wipe every file on the remote to match the empty source.
-    if mode == "push" && !local_dir_has_content(&local) {
+    if mode == "push" && !local_dir_has_syncable_content(cfg, &local)? {
         return Err(format!(
-            "Refusing to push: local directory '{}' is empty or missing contents. \
-             This would delete all remote files for '{}'.",
+            "Refusing to push: local directory '{}' has no syncable contents after excludes. \
+             This would delete remote files for '{}'.",
             local, project.name
         ));
     }
@@ -155,9 +180,9 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
 
     // Safety: refuse to bisync an empty local directory — could propagate
     // deletions to the remote.
-    if !local_dir_has_content(&local) {
+    if !local_dir_has_syncable_content(cfg, &local)? {
         return Err(format!(
-            "Refusing to bi-sync: local directory '{}' is empty or missing contents. \
+            "Refusing to bi-sync: local directory '{}' has no syncable contents after excludes. \
              This could delete remote files for '{}'.",
             local, project.name
         ));
@@ -242,7 +267,7 @@ pub fn list_remote(cfg: &AppConfig, remote_name: Option<&str>) -> Result<Vec<Rem
     } else {
         cfg.active_remote()
     };
-    let output = Command::new(&rclone)
+    let output = rclone_command(&rclone)
         .args(["lsd", &format!("{}:{}", rc.name, rc.base_path)])
         .output()
         .map_err(|e| format!("Failed to run rclone lsd: {e}"))?;
@@ -292,4 +317,134 @@ pub fn local_dir_has_content(path: &str) -> bool {
                     .any(|e| !is_os_junk(&e.file_name().to_string_lossy()))
             })
             .unwrap_or(false)
+}
+
+fn normalize_for_match(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn has_syncable_entries(root: &Path, dir: &Path, excludes: &GlobSet) -> Result<bool, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_os_junk(&name) {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|e| format!("Failed to normalize {}: {}", path.display(), e))?;
+        let rel_str = normalize_for_match(rel);
+        if excludes.is_match(&rel_str) {
+            continue;
+        }
+
+        if path.is_file() || path.is_symlink() {
+            return Ok(true);
+        }
+
+        if path.is_dir() && has_syncable_entries(root, &path, excludes)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn local_dir_has_syncable_content(cfg: &AppConfig, path: &str) -> Result<bool, String> {
+    let expanded = expand_tilde(path);
+    let root = Path::new(&expanded);
+    if !root.exists() || !root.is_dir() {
+        return Ok(false);
+    }
+
+    let excludes = build_exclude_set(cfg)?;
+    has_syncable_entries(root, root, &excludes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_dir_has_syncable_content;
+    use crate::config::{AppConfig, RemoteConfig};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "rcsync-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn test_cfg(excludes: Vec<&str>) -> AppConfig {
+        AppConfig {
+            rclone_path: "rclone".into(),
+            remote: "gdrive".into(),
+            remotes: vec![RemoteConfig {
+                name: "gdrive".into(),
+                base_path: "proj".into(),
+            }],
+            excludes: excludes.into_iter().map(str::to_string).collect(),
+            default_excludes: vec![],
+            extra_excludes: vec![],
+            projects: vec![],
+            scan_dirs: vec![],
+            default_pull_dir: String::new(),
+            auto_check_on_launch: false,
+        }
+    }
+
+    #[test]
+    fn ignores_only_os_junk() {
+        let dir = temp_dir("junk");
+        fs::write(dir.join(".DS_Store"), "").unwrap();
+
+        let has_content = local_dir_has_syncable_content(&test_cfg(vec![]), dir.to_str().unwrap()).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!has_content);
+    }
+
+    #[test]
+    fn ignores_only_excluded_files() {
+        let dir = temp_dir("excluded");
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::write(dir.join("node_modules/pkg/index.js"), "x").unwrap();
+
+        let has_content = local_dir_has_syncable_content(
+            &test_cfg(vec!["node_modules/**"]),
+            dir.to_str().unwrap(),
+        )
+        .unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!has_content);
+    }
+
+    #[test]
+    fn finds_nested_non_excluded_files() {
+        let dir = temp_dir("nested");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/main.ts"), "export {};\n").unwrap();
+
+        let has_content = local_dir_has_syncable_content(
+            &test_cfg(vec!["node_modules/**"]),
+            dir.to_str().unwrap(),
+        )
+        .unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(has_content);
+    }
 }
