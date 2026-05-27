@@ -133,10 +133,19 @@ impl AppConfig {
         self.get_remote(&name)
     }
 
-    /// Build the full rclone remote path for a project
+    /// Build the full rclone remote path for a project.
+    /// If `project.remote_path` is non-empty, it overrides the default `{base_path}/{name}`
+    /// — allowing a project to live anywhere under its remote (e.g. "docs/important-thing"
+    /// instead of "proj/important-thing"). A leading "/" in the override is stripped so
+    /// the result is always relative to the remote root.
     pub fn remote_path_for_project(&self, project: &Project) -> String {
         let rc = self.project_remote(project);
-        format!("{}:{}/{}", rc.name, rc.base_path, project.name)
+        let path = if project.remote_path.is_empty() {
+            format!("{}/{}", rc.base_path, project.name)
+        } else {
+            project.remote_path.trim_start_matches('/').to_string()
+        };
+        format!("{}:{}", rc.name, path)
     }
 }
 
