@@ -244,12 +244,15 @@ fn load_defaults() -> Defaults {
 }
 
 /// Get the machine hostname, lowercased and sanitised for use in filenames.
+/// Strips a trailing ".local" (macOS Bonjour) so e.g. "BMST.local" → "bmst",
+/// matching the user's per-device config naming on other platforms.
 pub fn machine_name() -> String {
-    std::env::var("RCSYNC_MACHINE")
+    let raw = std::env::var("RCSYNC_MACHINE")
         .or_else(|_| hostname::get()
             .map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|_| "default".into())
-        .to_lowercase()
+        .to_lowercase();
+    raw.strip_suffix(".local").unwrap_or(&raw).to_string()
 }
 
 /// Portable user config path. Resolution order:
