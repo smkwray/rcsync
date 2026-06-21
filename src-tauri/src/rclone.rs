@@ -30,9 +30,22 @@ fn build_exclude_args(cfg: &AppConfig) -> Vec<String> {
         .collect()
 }
 
-fn build_exclude_set(cfg: &AppConfig) -> Result<GlobSet, String> {
+/// Per-project excludes as rclone `--exclude PATTERN` args. Applied in addition
+/// to the global excludes, only for this project's operations.
+fn project_exclude_args(project: &Project) -> Vec<String> {
+    project
+        .excludes
+        .iter()
+        .filter(|e| !e.trim().is_empty())
+        .flat_map(|e| vec!["--exclude".to_string(), e.clone()])
+        .collect()
+}
+
+/// Build the glob set used by the empty-directory safety check, combining the
+/// global excludes with any extra (per-project) patterns.
+fn build_exclude_set_with(cfg: &AppConfig, extra: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
-    for pattern in &cfg.excludes {
+    for pattern in cfg.excludes.iter().chain(extra.iter()) {
         let glob = Glob::new(pattern)
             .map_err(|e| format!("Invalid exclude pattern '{}': {}", pattern, e))?;
         builder.add(glob);
@@ -147,7 +160,7 @@ pub fn sync_project(
 
     // Safety: refuse to push an empty local directory — rclone sync would
     // wipe every file on the remote to match the empty source.
-    if mode == "push" && !local_dir_has_syncable_content(cfg, &local)? {
+    if mode == "push" && !local_dir_has_syncable_content_with(cfg, &local, &project.excludes)? {
         return Err(format!(
             "Refusing to push: local directory '{}' has no syncable contents after excludes. \
              This would delete remote files for '{}'.",
@@ -162,6 +175,7 @@ pub fn sync_project(
 
     let mut args = vec!["sync".to_string(), src, dst];
     args.extend(build_exclude_args(cfg));
+    args.extend(project_exclude_args(project));
     args.push("-v".to_string());
     if dry_run {
         args.push("--dry-run".to_string());
@@ -180,7 +194,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
 
     // Safety: refuse to bisync an empty local directory — could propagate
     // deletions to the remote.
-    if !local_dir_has_syncable_content(cfg, &local)? {
+    if !local_dir_has_syncable_content_with(cfg, &local, &project.excludes)? {
         return Err(format!(
             "Refusing to bi-sync: local directory '{}' has no syncable contents after excludes. \
              This could delete remote files for '{}'.",
@@ -192,6 +206,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
 
     let mut args = vec!["bisync".to_string(), local, remote];
     args.extend(build_exclude_args(cfg));
+    args.extend(project_exclude_args(project));
     args.push("-v".to_string());
 
     let (output, code) = run_rclone(cfg, &args)?;
@@ -214,6 +229,7 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<String, Strin
         "-".to_string(),
     ];
     args.extend(build_exclude_args(cfg));
+    args.extend(project_exclude_args(project));
 
     let (raw_output, code) = run_rclone(cfg, &args)?;
 
@@ -355,20 +371,28 @@ fn has_syncable_entries(root: &Path, dir: &Path, excludes: &GlobSet) -> Result<b
     Ok(false)
 }
 
-pub fn local_dir_has_syncable_content(cfg: &AppConfig, path: &str) -> Result<bool, String> {
+/// Whether a directory has any content that would actually be synced, honoring
+/// the global excludes plus any per-project excludes. Pass `&[]` for the
+/// global-only case. Used as the empty-directory safety check so it matches
+/// exactly what rclone will sync.
+pub fn local_dir_has_syncable_content_with(
+    cfg: &AppConfig,
+    path: &str,
+    project_excludes: &[String],
+) -> Result<bool, String> {
     let expanded = expand_tilde(path);
     let root = Path::new(&expanded);
     if !root.exists() || !root.is_dir() {
         return Ok(false);
     }
 
-    let excludes = build_exclude_set(cfg)?;
+    let excludes = build_exclude_set_with(cfg, project_excludes)?;
     has_syncable_entries(root, root, &excludes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::local_dir_has_syncable_content;
+    use super::local_dir_has_syncable_content_with;
     use crate::config::{AppConfig, RemoteConfig};
     use std::fs;
     use std::path::PathBuf;
@@ -410,7 +434,7 @@ mod tests {
         let dir = temp_dir("junk");
         fs::write(dir.join(".DS_Store"), "").unwrap();
 
-        let has_content = local_dir_has_syncable_content(&test_cfg(vec![]), dir.to_str().unwrap()).unwrap();
+        let has_content = local_dir_has_syncable_content_with(&test_cfg(vec![]), dir.to_str().unwrap(), &[]).unwrap();
 
         fs::remove_dir_all(&dir).unwrap();
         assert!(!has_content);
@@ -422,9 +446,10 @@ mod tests {
         fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
         fs::write(dir.join("node_modules/pkg/index.js"), "x").unwrap();
 
-        let has_content = local_dir_has_syncable_content(
+        let has_content = local_dir_has_syncable_content_with(
             &test_cfg(vec!["node_modules/**"]),
             dir.to_str().unwrap(),
+            &[],
         )
         .unwrap();
 
@@ -433,14 +458,40 @@ mod tests {
     }
 
     #[test]
+    fn per_project_exclude_filters_otherwise_present_content() {
+        // A directory whose ONLY content lives under artifacts/ must read as
+        // empty once "artifacts/**" is supplied as a per-project exclude, and
+        // as non-empty without it. This is the invariant that lets per-project
+        // excludes safely keep generated dirs out of the sync; if project
+        // excludes stopped being applied, the first assert would flip to true.
+        let dir = temp_dir("proj-exclude");
+        fs::create_dir_all(dir.join("artifacts/solver_wip_triage")).unwrap();
+        fs::write(dir.join("artifacts/solver_wip_triage/run.json"), "{}").unwrap();
+
+        let cfg = test_cfg(vec![]); // no GLOBAL exclude for artifacts
+        let project_excludes = vec!["artifacts/**".to_string()];
+
+        let with_exclude =
+            local_dir_has_syncable_content_with(&cfg, dir.to_str().unwrap(), &project_excludes)
+                .unwrap();
+        let without_exclude =
+            local_dir_has_syncable_content_with(&cfg, dir.to_str().unwrap(), &[]).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!with_exclude, "artifacts/** project exclude should empty the dir");
+        assert!(without_exclude, "without the exclude the dir has real content");
+    }
+
+    #[test]
     fn finds_nested_non_excluded_files() {
         let dir = temp_dir("nested");
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("src/main.ts"), "export {};\n").unwrap();
 
-        let has_content = local_dir_has_syncable_content(
+        let has_content = local_dir_has_syncable_content_with(
             &test_cfg(vec!["node_modules/**"]),
             dir.to_str().unwrap(),
+            &[],
         )
         .unwrap();
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import type { Project, SyncMode } from "./types";
+  import type { Project, RemoteConfig, SyncMode } from "./types";
 
   let {
     project,
@@ -11,6 +11,7 @@
     onaction,
     ondelete,
     onpin,
+    onupdated,
   }: {
     project: Project;
     running: boolean;
@@ -20,10 +21,106 @@
     onaction: (project: Project, mode: SyncMode) => void;
     ondelete: (project: Project) => void;
     onpin: (project: Project) => void;
+    onupdated?: () => void;
   } = $props();
 
   function openFolder() {
     invoke("open_folder", { localPath: project.local_path });
+  }
+
+  // --- Project-specific ignore patterns ---
+  let showIgnores = $state(false);
+  let ignoreText = $state("");
+  let savingIgnores = $state(false);
+  let ignoreError = $state("");
+  let ignoreTextarea: HTMLTextAreaElement | undefined = $state(undefined);
+
+  $effect(() => { if (showIgnores) ignoreTextarea?.focus(); });
+
+  async function openIgnores() {
+    ignoreError = "";
+    try {
+      const patterns = await invoke<string[]>("get_project_excludes", { projectName: project.name });
+      ignoreText = patterns.join("\n");
+    } catch (e) {
+      ignoreText = "";
+      ignoreError = `Could not load existing patterns: ${e}`;
+    }
+    showIgnores = true;
+  }
+
+  function closeIgnores() {
+    showIgnores = false;
+  }
+
+  async function saveIgnores() {
+    savingIgnores = true;
+    ignoreError = "";
+    const patterns = ignoreText
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    try {
+      await invoke("set_project_excludes", { projectName: project.name, excludes: patterns });
+      showIgnores = false;
+    } catch (e) {
+      ignoreError = `${e}`;
+    } finally {
+      savingIgnores = false;
+    }
+  }
+
+  function handleIgnoreKey(e: KeyboardEvent) {
+    if (e.key === "Escape") { e.preventDefault(); closeIgnores(); }
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveIgnores(); }
+  }
+
+  // --- Per-project remote ---
+  let showRemote = $state(false);
+  let remoteChoice = $state("");
+  let remotePathInput = $state("");
+  let savingRemote = $state(false);
+  let remoteError = $state("");
+  let availableRemotes: RemoteConfig[] = $state([]);
+
+  async function openRemoteEditor() {
+    remoteError = "";
+    remoteChoice = project.remote;
+    remotePathInput = project.remote_path;
+    try {
+      availableRemotes = await invoke<RemoteConfig[]>("get_remotes");
+    } catch (e) {
+      availableRemotes = [];
+      remoteError = `Could not load remotes: ${e}`;
+    }
+    showRemote = true;
+  }
+
+  function closeRemoteEditor() {
+    showRemote = false;
+  }
+
+  async function saveRemote() {
+    savingRemote = true;
+    remoteError = "";
+    try {
+      await invoke("set_project_remote", {
+        projectName: project.name,
+        remote: remoteChoice,
+        remotePath: remotePathInput.trim(),
+      });
+      showRemote = false;
+      onupdated?.();
+    } catch (e) {
+      remoteError = `${e}`;
+    } finally {
+      savingRemote = false;
+    }
+  }
+
+  function handleRemoteKey(e: KeyboardEvent) {
+    if (e.key === "Escape") { e.preventDefault(); closeRemoteEditor(); }
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveRemote(); }
   }
 
   function runLabel(): string {
@@ -47,6 +144,11 @@
         </svg>
       </button>
       <span class="name">{project.name}</span>
+      <button class="icon-btn name-folder-btn" title="Open in file manager" onclick={openFolder}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
     </div>
     <div class="header-right">
       {#if running}
@@ -63,9 +165,9 @@
           <span class="check-time">{checkStatus.time}</span>
         </div>
       {/if}
-      <button class="icon-btn" title="Open in file manager" onclick={openFolder}>
+      <button class="icon-btn" title="Project-specific ignores" onclick={openIgnores}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
         </svg>
       </button>
       <button class="trash-btn" title="Delete local copy" onclick={() => ondelete(project)}>
@@ -78,7 +180,14 @@
 
   <div class="paths">
     <div class="path"><span class="label">local</span> {project.local_path}</div>
-    <div class="path"><span class="label">remote</span> <span class="remote-tag">{project.remote}</span>{project.remote_path}</div>
+    <div class="path">
+      <span class="label">remote</span> <span class="remote-tag">{project.remote}</span>{project.remote_path}
+      <button class="edit-remote-btn" title="Change remote for this project" onclick={openRemoteEditor}>
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
+        </svg>
+      </button>
+    </div>
   </div>
 
   <div class="actions">
@@ -89,6 +198,66 @@
     <button class="danger" disabled={running} onclick={() => onaction(project, "pull")}>Pull</button>
   </div>
 </div>
+
+{#if showIgnores}
+  <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onkeydown={handleIgnoreKey}>
+    <div class="ignore-dialog">
+      <h3>Ignore patterns — {project.name}</h3>
+      <p class="hint">
+        Patterns excluded for <strong>this project only</strong>, one per line (e.g.
+        <code>artifacts/**</code>). Applied on top of the global excludes when pushing,
+        pulling, checking, or bi-syncing. Paths are relative to the project root.
+      </p>
+      <textarea
+        bind:this={ignoreTextarea}
+        bind:value={ignoreText}
+        spellcheck="false"
+        autocapitalize="off"
+        {...{ autocorrect: "off" }}
+        placeholder={"artifacts/**\ndata/cache/**"}
+        rows="7"
+      ></textarea>
+      {#if ignoreError}<p class="err">{ignoreError}</p>{/if}
+      <div class="dialog-actions">
+        <button class="cancel-btn" onclick={closeIgnores} disabled={savingIgnores}>Cancel</button>
+        <button class="primary" onclick={saveIgnores} disabled={savingIgnores}>
+          {savingIgnores ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showRemote}
+  <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onkeydown={handleRemoteKey}>
+    <div class="ignore-dialog">
+      <h3>Remote — {project.name}</h3>
+      <p class="hint">
+        Which remote this project syncs to, and the path on that remote. Changing this only
+        re-targets future syncs — it does not move or delete anything already uploaded elsewhere.
+      </p>
+      <label class="field">
+        <span>Remote</span>
+        <select bind:value={remoteChoice}>
+          {#each availableRemotes as r}
+            <option value={r.name}>{r.name}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="field">
+        <span>Path on remote</span>
+        <input type="text" bind:value={remotePathInput} spellcheck="false" autocorrect="off" autocapitalize="off" placeholder={"proj/" + project.name} />
+      </label>
+      {#if remoteError}<p class="err">{remoteError}</p>{/if}
+      <div class="dialog-actions">
+        <button class="cancel-btn" onclick={closeRemoteEditor} disabled={savingRemote}>Cancel</button>
+        <button class="primary" onclick={saveRemote} disabled={savingRemote || !remoteChoice}>
+          {savingRemote ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .card {
@@ -170,6 +339,9 @@
   .icon-btn:hover { opacity: 1; color: var(--accent); background: transparent; border: none; }
   .trash-btn:hover { opacity: 1; color: var(--red); background: transparent; border: none; }
 
+  /* Folder icon relocated next to the project name */
+  .name-folder-btn { padding: 2px 3px; opacity: 0.35; }
+
   .paths { margin-bottom: 10px; }
   .path {
     font-family: var(--font-mono);
@@ -193,4 +365,98 @@
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   button.warn { border-color: var(--yellow); color: var(--yellow); }
   button.warn:hover { background: var(--yellow-dim); }
+
+  /* Project-specific ignores dialog */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 300;
+  }
+  .ignore-dialog {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px;
+    max-width: 460px;
+    width: 90%;
+  }
+  .ignore-dialog h3 { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+  .hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.6;
+    margin-bottom: 12px;
+  }
+  .hint code {
+    font-family: var(--font-mono);
+    background: var(--bg-hover);
+    padding: 0 4px;
+    border-radius: 3px;
+    color: var(--accent);
+  }
+  .ignore-dialog textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    resize: vertical;
+  }
+  .ignore-dialog textarea:focus { outline: none; border-color: var(--accent); }
+  .err { color: var(--red); font-size: 12px; margin-top: 8px; }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .cancel-btn { font-weight: 600; }
+
+  /* Inline pencil for the remote line */
+  .edit-remote-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 3px;
+    margin-left: 5px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0.35;
+    vertical-align: middle;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .edit-remote-btn:hover { opacity: 1; color: var(--accent); background: transparent; border: none; }
+
+  /* Remote dialog form fields */
+  .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .field > span {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .ignore-dialog select,
+  .ignore-dialog input[type="text"] {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 8px;
+  }
+  .ignore-dialog select:focus,
+  .ignore-dialog input[type="text"]:focus { outline: none; border-color: var(--accent); }
 </style>
