@@ -24,11 +24,12 @@
 
   let confirmState: {
     title: string; message: string; confirmLabel: string; danger: boolean;
+    requirePhrase?: string;
     resolve: (v: boolean) => void;
   } | null = $state(null);
 
-  function customConfirm(title: string, message: string, confirmLabel = "Confirm", danger = true): Promise<boolean> {
-    return new Promise((resolve) => { confirmState = { title, message, confirmLabel, danger, resolve }; });
+  function customConfirm(title: string, message: string, confirmLabel = "Confirm", danger = true, requirePhrase = ""): Promise<boolean> {
+    return new Promise((resolve) => { confirmState = { title, message, confirmLabel, danger, requirePhrase, resolve }; });
   }
   function onConfirmYes() { confirmState?.resolve(true); confirmState = null; }
   function onConfirmNo() { confirmState?.resolve(false); confirmState = null; }
@@ -146,8 +147,10 @@
     if (mode === "pull") {
       const ok = await customConfirm(
         `Pull "${project.name}"?`,
-        `This will overwrite local files with ${project.remote} contents.\nLocal is always authoritative — only pull if the remote version is what you want.`,
+        `This will OVERWRITE local files with ${project.remote} contents.\nLocal is normally authoritative — only pull if the remote version is what you want.`,
         "Pull from Remote",
+        true,
+        "pull",
       );
       if (!ok) return;
     }
@@ -196,7 +199,13 @@
       "Delete Local Copy",
     );
     if (!ok) return;
-    const really = await customConfirm("Final confirmation", `Permanently delete "${project.name}" from this device?`, "Yes, Delete");
+    const really = await customConfirm(
+      "Final confirmation",
+      `Type delete to permanently remove "${project.name}" from this device. The remote copy on ${project.remote} is not affected.`,
+      "Delete",
+      true,
+      "delete",
+    );
     if (!really) return;
 
     try {
@@ -339,8 +348,23 @@
       e.preventDefault();
       if (showShortcutsHelp) { showShortcutsHelp = false; return; }
       window.dispatchEvent(new CustomEvent("close-overlays"));
-      if (inInput) { (document.activeElement as HTMLElement).blur(); return; }
+      if (inInput) {
+        const active = document.activeElement as HTMLElement;
+        // In the filter box, also clear the text so the list resets.
+        if (active === filterInput) { search = ""; selectedIndex = -1; }
+        active.blur();
+        return;
+      }
       if (selectedIndex >= 0) { selectedIndex = -1; return; }
+      return;
+    }
+
+    // Enter in the filter: commit it — exit the box and select the first result
+    // so hotkeys act on it immediately.
+    if (e.key === "Enter" && document.activeElement === filterInput) {
+      e.preventDefault();
+      filterInput?.blur();
+      selectedIndex = filteredProjects.length > 0 ? 0 : -1;
       return;
     }
 
@@ -400,6 +424,7 @@
     <div class="toolbar-actions">
       <div class="search-wrapper">
         <input class="search-input" type="text" placeholder="Filter..." bind:value={search} bind:this={filterInput}
+          autocorrect="off" autocapitalize="off" autocomplete="off" spellcheck="false"
           onfocus={() => selectedIndex = -1} />
         {#if search}
           <span class="search-count">{filteredProjects.length}/{localProjects.length}</span>
@@ -443,6 +468,7 @@
               onaction={handleAction}
               ondelete={handleDelete}
               onpin={togglePin}
+              onupdated={loadProjects}
             />
           </div>
         {/each}
@@ -476,6 +502,7 @@
     message={confirmState.message}
     confirmLabel={confirmState.confirmLabel}
     danger={confirmState.danger}
+    requirePhrase={confirmState.requirePhrase ?? ""}
     onconfirm={onConfirmYes}
     oncancel={onConfirmNo}
   />

@@ -3,6 +3,8 @@ export interface Project {
   local_path: string;
   remote_path: string;
   remote: string;
+  /** Per-project rclone excludes, applied on top of the global excludes for this project only. */
+  excludes?: string[];
 }
 
 export interface RemoteConfig {

@@ -10,6 +10,12 @@ pub struct Project {
     /// Which remote this project syncs with. Empty/missing = first remote in list.
     #[serde(default)]
     pub remote: String,
+    /// Per-project rclone excludes, applied IN ADDITION to the global excludes
+    /// but only when syncing THIS project. Each entry is an rclone filter
+    /// pattern matched relative to the project root, e.g. "artifacts/**".
+    /// Empty/missing = no project-specific excludes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

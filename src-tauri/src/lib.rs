@@ -91,6 +91,72 @@ fn update_config(cfg: AppConfig) -> Result<(), String> {
     save_config(&cfg)
 }
 
+/// Read the per-project excludes for a project. Returns an empty list for
+/// projects that exist only via scan discovery (no config entry yet).
+#[tauri::command]
+fn get_project_excludes(project_name: String) -> Vec<String> {
+    load_config()
+        .projects
+        .iter()
+        .find(|p| p.name == project_name)
+        .map(|p| p.excludes.clone())
+        .unwrap_or_default()
+}
+
+/// Set the per-project excludes for a project and persist them. If the project
+/// is not yet in the config (scan-discovered), it is materialized into the
+/// config so the excludes have a home — exactly the same record a manual
+/// `push` would resolve, so nothing else about the project changes.
+#[tauri::command]
+fn set_project_excludes(project_name: String, excludes: Vec<String>) -> Result<(), String> {
+    // Normalize: trim, drop blank lines, dedupe while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    let cleaned: Vec<String> = excludes
+        .into_iter()
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .filter(|e| seen.insert(e.clone()))
+        .collect();
+
+    let mut cfg = load_config();
+    if let Some(p) = cfg.projects.iter_mut().find(|p| p.name == project_name) {
+        p.excludes = cleaned;
+    } else {
+        let mut project = find_project(&cfg, &project_name)?;
+        project.excludes = cleaned;
+        cfg.projects.push(project);
+    }
+    save_config(&cfg)
+}
+
+/// Change which remote (and path on that remote) a project syncs to, and
+/// persist it. Materializes a config entry for scan-discovered projects, same
+/// as `set_project_excludes`. The remote must be one of the configured remotes.
+/// This only changes future sync targeting — it never moves or deletes anything
+/// already uploaded to the old remote.
+#[tauri::command]
+fn set_project_remote(
+    project_name: String,
+    remote: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let mut cfg = load_config();
+    if !cfg.remotes.iter().any(|r| r.name == remote) {
+        return Err(format!("Remote '{}' is not configured", remote));
+    }
+    let remote_path = remote_path.trim().to_string();
+    if let Some(p) = cfg.projects.iter_mut().find(|p| p.name == project_name) {
+        p.remote = remote;
+        p.remote_path = remote_path;
+    } else {
+        let mut project = find_project(&cfg, &project_name)?;
+        project.remote = remote;
+        project.remote_path = remote_path;
+        cfg.projects.push(project);
+    }
+    save_config(&cfg)
+}
+
 /// All rclone commands run in spawn_blocking and return their output as a string.
 
 #[tauri::command]
@@ -309,6 +375,7 @@ async fn pull_new_project(name: String, local_path: String) -> Result<String, St
         local_path: local_path.clone(),
         remote_path: format!("proj/{name}"),
         remote: cfg.remote.clone(), // Use the active remote at time of pull
+        excludes: Vec::new(),
     };
 
     let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
@@ -351,6 +418,7 @@ fn find_project(cfg: &AppConfig, name: &str) -> Result<Project, String> {
             local_path,
             remote_path: format!("proj/{}", name),
             remote: cfg.default_remote_name(),
+            excludes: Vec::new(),
         });
     }
     Err(format!("Project '{}' not found", name))
@@ -401,6 +469,9 @@ pub fn run() {
             get_machine_name,
             get_projects_status,
             update_config,
+            get_project_excludes,
+            set_project_excludes,
+            set_project_remote,
             push,
             pull,
             check,

@@ -4,6 +4,7 @@
     message,
     confirmLabel = "Confirm",
     danger = false,
+    requirePhrase = "",
     onconfirm,
     oncancel,
   }: {
@@ -11,17 +12,26 @@
     message: string;
     confirmLabel?: string;
     danger?: boolean;
+    /** If set, the user must type this exact word (case-insensitive) to enable Confirm. */
+    requirePhrase?: string;
     onconfirm: () => void;
     oncancel: () => void;
   } = $props();
 
   let cancelBtn: HTMLButtonElement | undefined = $state(undefined);
+  let phraseInput: HTMLInputElement | undefined = $state(undefined);
+  let typed = $state("");
 
-  // Focus Cancel by default so Enter = No
-  $effect(() => { cancelBtn?.focus(); });
+  let matched = $derived(
+    requirePhrase ? typed.trim().toLowerCase() === requirePhrase.trim().toLowerCase() : true
+  );
+
+  // With a required phrase, focus the input; otherwise focus Cancel so Enter = No.
+  $effect(() => { if (requirePhrase) phraseInput?.focus(); else cancelBtn?.focus(); });
 
   function handleKey(e: KeyboardEvent) {
     if (e.key === "Escape") { e.preventDefault(); oncancel(); }
+    if (e.key === "Enter" && requirePhrase && matched) { e.preventDefault(); onconfirm(); }
   }
 </script>
 
@@ -29,9 +39,22 @@
   <div class="dialog">
     <h3>{title}</h3>
     <p class="msg">{@html message.replace(/\n/g, "<br>")}</p>
+    {#if requirePhrase}
+      <input
+        class="phrase-input"
+        type="text"
+        bind:value={typed}
+        bind:this={phraseInput}
+        autocorrect="off"
+        autocapitalize="off"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder={`type "${requirePhrase}" to confirm`}
+      />
+    {/if}
     <div class="actions">
       <button bind:this={cancelBtn} class="cancel-btn" onclick={oncancel}>Cancel</button>
-      <button class={danger ? "danger" : "primary"} onclick={onconfirm}>{confirmLabel}</button>
+      <button class={danger ? "danger" : "primary"} disabled={requirePhrase ? !matched : false} onclick={onconfirm}>{confirmLabel}</button>
     </div>
   </div>
 </div>
@@ -83,4 +106,20 @@
     box-shadow: 0 0 0 2px var(--accent);
     outline: none;
   }
+
+  .phrase-input {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 18px;
+  }
+  .phrase-input:focus { outline: none; border-color: var(--accent); }
+
+  .actions button:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
