@@ -334,8 +334,8 @@
 
     if (confirmState) {
       if (e.key === "Escape") { e.preventDefault(); onConfirmNo(); }
-      // Let Tab and Enter through so the dialog buttons work naturally
-      if (e.key === "Tab" || e.key === "Enter") return;
+      // Let the confirmation field receive text, and let dialog controls work naturally.
+      if (e.target instanceof HTMLInputElement || e.key === "Tab" || e.key === "Enter") return;
       e.preventDefault();
       return;
     }
