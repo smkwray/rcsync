@@ -11,6 +11,7 @@ dist/
 
 # Build artifacts
 *.dmg
+build/
 
 # Config (contains user-specific paths)
 rcsync-config.json

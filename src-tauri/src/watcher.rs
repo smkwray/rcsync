@@ -17,9 +17,9 @@ pub struct FileChangeEvent {
 /// Start watching all project directories. Emits "file-change" events to the frontend.
 /// Returns a handle that keeps the watcher alive; drop it to stop watching.
 ///
-/// Uses NonRecursive mode to avoid kqueue panics on macOS with symlinks/special files.
-/// This means we only detect changes in the top-level project directory, but that's
-/// sufficient since most edits touch files that bubble up as directory mtime changes.
+/// Uses NonRecursive mode so only direct project children generate events. On macOS,
+/// `notify` must use its default FSEvents backend: kqueue can promote a directory watch
+/// to recursive after directory churn and consume one file descriptor per descendant.
 pub fn start_watcher(app: AppHandle) -> Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>> {
     let cfg = load_config();
 
@@ -63,7 +63,7 @@ pub fn start_watcher(app: AppHandle) -> Option<notify_debouncer_mini::Debouncer<
 
     let mut debouncer = new_debouncer(Duration::from_secs(3), tx).ok()?;
 
-    // Watch each project dir non-recursively to avoid kqueue panics with symlinks
+    // Watch each project dir non-recursively to limit status invalidations.
     for (path, _name) in &watch_dirs {
         let _ = debouncer.watcher().watch(path, notify::RecursiveMode::NonRecursive);
     }
@@ -102,4 +102,17 @@ pub fn start_watcher(app: AppHandle) -> Option<notify_debouncer_mini::Debouncer<
     });
 
     Some(debouncer)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use notify::Watcher;
+
+    #[test]
+    fn recommended_watcher_uses_fsevents_on_macos() {
+        assert_eq!(
+            <notify::RecommendedWatcher as Watcher>::kind(),
+            notify::WatcherKind::Fsevent
+        );
+    }
 }
