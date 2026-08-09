@@ -1,14 +1,16 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import type { Project, RemoteConfig, SyncMode } from "./types";
+  import type { CheckStatus, Project, RemoteConfig, SyncMode } from "./types";
 
   let {
     project,
     running = false,
     runningMode = "",
+    cancelling = false,
     checkStatus = null,
     pinned = false,
     onaction,
+    oncancel,
     ondelete,
     onpin,
     onupdated,
@@ -16,13 +18,27 @@
     project: Project;
     running: boolean;
     runningMode: string;
-    checkStatus: { time: string; synced: boolean; diffs: number } | null;
+    cancelling: boolean;
+    checkStatus: CheckStatus | null;
     pinned: boolean;
     onaction: (project: Project, mode: SyncMode) => void;
+    oncancel: (project: Project) => void;
     ondelete: (project: Project) => void;
     onpin: (project: Project) => void;
     onupdated?: () => void;
   } = $props();
+
+  /** The action row, in display order. While an operation runs, the button that
+   *  started it becomes the Cancel control and the rest gray out — so stopping
+   *  is a zero-travel click from wherever it was started, and it is never
+   *  ambiguous which project is being stopped. */
+  const ACTIONS: { mode: SyncMode; label: string; cls: string }[] = [
+    { mode: "push", label: "Push", cls: "primary" },
+    { mode: "dry-run", label: "Dry Run", cls: "" },
+    { mode: "check", label: "Check", cls: "" },
+    { mode: "bisync", label: "Bi-Sync", cls: "warn" },
+    { mode: "pull", label: "Pull", cls: "danger" },
+  ];
 
   function openFolder() {
     invoke("open_folder", { localPath: project.local_path });
@@ -124,6 +140,7 @@
   }
 
   function runLabel(): string {
+    if (cancelling) return "stopping";
     switch (runningMode) {
       case "check": return "checking";
       case "push": return "pushing";
@@ -135,7 +152,11 @@
   }
 </script>
 
-<div class="card" class:running class:synced={checkStatus?.synced} class:unsynced={checkStatus && !checkStatus.synced && checkStatus.diffs !== -1} class:modified={checkStatus?.diffs === -1}>
+<div class="card" class:running
+  class:synced={checkStatus?.state === "synced"}
+  class:unsynced={checkStatus?.state === "diffs"}
+  class:modified={checkStatus?.state === "modified"}
+  class:unknown={checkStatus?.state === "unknown"}>
   <div class="card-header">
     <div class="name-row">
       <button class="pin-btn" class:pinned title={pinned ? "Unpin" : "Pin to top"} onclick={() => onpin(project)}>
@@ -155,10 +176,14 @@
         <span class="badge running-badge">{runLabel()}</span>
       {:else if checkStatus}
         <div class="check-info">
-          {#if checkStatus.synced}
+          {#if checkStatus.state === "synced"}
             <span class="badge synced-badge">synced</span>
-          {:else if checkStatus.diffs === -1}
+          {:else if checkStatus.state === "modified"}
             <span class="badge modified-badge">modified</span>
+          {:else if checkStatus.state === "unknown"}
+            <!-- The last operation failed, so any previous verdict is withdrawn
+                 rather than left standing. -->
+            <span class="badge unknown-badge" title="The last operation failed — run Check">unknown</span>
           {:else}
             <span class="badge unsynced-badge">{checkStatus.diffs} diff{checkStatus.diffs !== 1 ? "s" : ""}</span>
           {/if}
@@ -191,11 +216,16 @@
   </div>
 
   <div class="actions">
-    <button class="primary" disabled={running} onclick={() => onaction(project, "push")}>Push</button>
-    <button disabled={running} onclick={() => onaction(project, "dry-run")}>Dry Run</button>
-    <button disabled={running} onclick={() => onaction(project, "check")}>Check</button>
-    <button class="warn" disabled={running} onclick={() => onaction(project, "bisync")}>Bi-Sync</button>
-    <button class="danger" disabled={running} onclick={() => onaction(project, "pull")}>Pull</button>
+    {#each ACTIONS as { mode, label, cls } (mode)}
+      {#if running && runningMode === mode}
+        <button class="cancel-op" disabled={cancelling} title="Stop this {label.toLowerCase()}"
+          onclick={() => oncancel(project)}>
+          {cancelling ? "Stopping…" : "Cancel"}
+        </button>
+      {:else}
+        <button class={cls} disabled={running} onclick={() => onaction(project, mode)}>{label}</button>
+      {/if}
+    {/each}
   </div>
 </div>
 
@@ -273,6 +303,7 @@
   .card.synced { border-left: 3px solid var(--green); }
   .card.unsynced { border-left: 3px solid var(--yellow); }
   .card.modified { border-left: 3px solid var(--orange, var(--yellow)); }
+  .card.unknown { border-left: 3px solid var(--text-muted); }
 
   .card-header {
     display: flex;
@@ -320,6 +351,7 @@
   .synced-badge { background: var(--green-dim); color: var(--green); }
   .unsynced-badge { background: var(--yellow-dim); color: var(--yellow); }
   .modified-badge { background: var(--yellow-dim); color: var(--yellow); font-style: italic; }
+  .unknown-badge { background: var(--bg-hover); color: var(--text-muted); }
 
   .check-time {
     font-size: 10px;
@@ -365,6 +397,16 @@
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   button.warn { border-color: var(--yellow); color: var(--yellow); }
   button.warn:hover { background: var(--yellow-dim); }
+
+  /* Filled rather than outlined, so the one live control stands out against
+     the four grayed-out siblings around it. */
+  .cancel-op {
+    border-color: var(--red);
+    background: var(--red-dim);
+    color: var(--red);
+    font-weight: 600;
+  }
+  .cancel-op:hover:not(:disabled) { background: var(--red); color: var(--bg); }
 
   /* Project-specific ignores dialog */
   .overlay {

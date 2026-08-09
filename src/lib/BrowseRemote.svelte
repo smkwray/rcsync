@@ -113,11 +113,6 @@
     return "remote-badge";
   }
 
-  async function debugScan(name: string) {
-    const result = await invoke<string>("debug_scan", { name });
-    alert(result);
-  }
-
   loadRemotes().then(() => load());
 </script>
 
@@ -180,7 +175,6 @@
                 {/if}
               </div>
               <div class="dir-actions">
-                <button class="pull-btn" style="opacity:0.4;font-size:10px" onclick={() => debugScan(dir.name)}>?</button>
                 {#if dir.has_local && dir.in_config}
                   <span class="synced-label">Ready</span>
                 {:else if dir.has_local && !dir.in_config}

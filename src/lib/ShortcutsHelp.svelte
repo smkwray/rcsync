@@ -23,6 +23,7 @@
         ["e", "Open folder"],
         ["h", "Delete local"],
         ["i", "Pin / unpin"],
+        ["q", "Cancel running op"],
       ],
     },
     {
@@ -41,6 +42,7 @@
       title: "Always On",
       keys: [
         ["\u2318,", "Settings"],
+        ["\u2318.", "Cancel all ops"],
         ["\u2318K", "Toggle shortcuts"],
         ["\u2318O", "Toggle output"],
         ["?", "This help"],
