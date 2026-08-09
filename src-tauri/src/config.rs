@@ -57,6 +57,25 @@ pub struct UserConfig {
     /// User-added excludes (merged with defaults, not replacing them)
     #[serde(default)]
     pub extra_excludes: Vec<String>,
+    /// Parallel file transfers per rclone process. `None` means Automatic: pass
+    /// no flag at all, so rclone's own config or RCLONE_TRANSFERS still decides.
+    /// Machine-level policy, deliberately not per-project — it is about this
+    /// host's memory and this link, not about any one directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rclone_transfers: Option<i32>,
+}
+
+/// Accept only a bounded range. `i32` rather than a smaller unsigned type so a
+/// hand-edited negative still deserializes and reports a real error, instead of
+/// failing the whole-config parse and silently reverting every other setting.
+pub fn validate_rclone_transfers(value: Option<i32>) -> Result<(), String> {
+    match value {
+        None | Some(1..=8) => Ok(()),
+        Some(v) => Err(format!(
+            "rclone transfers must be between 1 and 8, or unset for Automatic; got {}",
+            v
+        )),
+    }
 }
 
 fn default_rclone_path() -> String {
@@ -90,6 +109,8 @@ pub struct AppConfig {
     pub default_pull_dir: String,
     #[serde(default)]
     pub auto_check_on_launch: bool,
+    #[serde(default)]
+    pub rclone_transfers: Option<i32>,
 }
 
 fn default_remotes() -> Vec<RemoteConfig> {
@@ -145,13 +166,24 @@ impl AppConfig {
     /// instead of "proj/important-thing"). A leading "/" in the override is stripped so
     /// the result is always relative to the remote root.
     pub fn remote_path_for_project(&self, project: &Project) -> String {
-        let rc = self.project_remote(project);
-        let path = if project.remote_path.is_empty() {
-            format!("{}/{}", rc.base_path, project.name)
+        format!(
+            "{}:{}",
+            self.project_remote(project).name,
+            self.project_remote_path(project)
+        )
+    }
+
+    /// The path portion alone, without the `remote:` prefix. The single place
+    /// that answers "where does this project live on its remote" — hardcoding
+    /// `proj/<name>` anywhere else silently ignores a remote whose configured
+    /// `base_path` is something different, and points operations at a tree the
+    /// user never chose.
+    pub fn project_remote_path(&self, project: &Project) -> String {
+        if project.remote_path.is_empty() {
+            format!("{}/{}", self.project_remote(project).base_path, project.name)
         } else {
             project.remote_path.trim_start_matches('/').to_string()
-        };
-        format!("{}:{}", rc.name, path)
+        }
     }
 }
 
@@ -174,6 +206,7 @@ impl Default for UserConfig {
             default_pull_dir: String::new(),
             auto_check_on_launch: false,
             extra_excludes: vec![],
+            rclone_transfers: None, // Automatic — let rclone decide
         }
     }
 }
@@ -200,6 +233,7 @@ impl Default for AppConfig {
                 defaults.default_pull_dir
             },
             auto_check_on_launch: false,
+            rclone_transfers: None,
         }
     }
 }
@@ -352,11 +386,13 @@ pub fn load_config() -> AppConfig {
         scan_dirs,
         default_pull_dir,
         auto_check_on_launch: user.auto_check_on_launch,
+        rclone_transfers: user.rclone_transfers,
     }
 }
 
 /// Save only the private user config. Defaults are never written by the app.
 pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
+    validate_rclone_transfers(cfg.rclone_transfers)?;
     let user = UserConfig {
         rclone_path: cfg.rclone_path.clone(),
         remote: cfg.remote.clone(),
@@ -366,6 +402,7 @@ pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
         default_pull_dir: cfg.default_pull_dir.clone(),
         auto_check_on_launch: cfg.auto_check_on_launch,
         extra_excludes: cfg.extra_excludes.clone(),
+        rclone_transfers: cfg.rclone_transfers,
     };
     let path = config_path();
     let json = serde_json::to_string_pretty(&user).map_err(|e| e.to_string())?;
@@ -403,4 +440,84 @@ pub fn find_local_path(cfg: &AppConfig, name: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_base(base: &str) -> AppConfig {
+        AppConfig {
+            remotes: vec![RemoteConfig {
+                name: "onedrive".into(),
+                base_path: base.into(),
+            }],
+            remote: "onedrive".into(),
+            ..Default::default()
+        }
+    }
+
+    fn project(remote_path: &str) -> Project {
+        Project {
+            name: "example".into(),
+            local_path: "~/projects/example".into(),
+            remote_path: remote_path.into(),
+            remote: "onedrive".into(),
+            excludes: vec![],
+        }
+    }
+
+    /// The defect this pins: several call sites used to build `proj/<name>` by
+    /// hand. On a remote configured with any other base path that silently
+    /// targeted a tree the user never chose — and Push makes the destination
+    /// match the source, so it could overwrite or delete whatever lived there.
+    #[test]
+    fn an_unset_remote_path_follows_the_remotes_configured_base() {
+        let cfg = cfg_with_base("Projects");
+        assert_eq!(cfg.project_remote_path(&project("")), "Projects/example");
+        assert_eq!(
+            cfg.remote_path_for_project(&project("")),
+            "onedrive:Projects/example"
+        );
+    }
+
+    #[test]
+    fn an_explicit_remote_path_still_overrides_the_base() {
+        let cfg = cfg_with_base("Projects");
+        assert_eq!(
+            cfg.project_remote_path(&project("archive/old-example")),
+            "archive/old-example"
+        );
+    }
+
+    #[test]
+    fn a_leading_slash_in_an_override_is_stripped() {
+        let cfg = cfg_with_base("Projects");
+        assert_eq!(cfg.project_remote_path(&project("/rooted/path")), "rooted/path");
+    }
+
+    #[test]
+    fn the_path_and_the_full_location_cannot_disagree() {
+        // One authority: the full `remote:path` form is built from the path form,
+        // so a future change cannot make them diverge.
+        let cfg = cfg_with_base("Backups");
+        for rp in ["", "custom/place", "/rooted"] {
+            let p = project(rp);
+            assert_eq!(
+                cfg.remote_path_for_project(&p),
+                format!("onedrive:{}", cfg.project_remote_path(&p))
+            );
+        }
+    }
+
+    #[test]
+    fn transfers_accepts_only_automatic_or_one_through_eight() {
+        assert!(validate_rclone_transfers(None).is_ok());
+        for n in 1..=8 {
+            assert!(validate_rclone_transfers(Some(n)).is_ok(), "{} should be allowed", n);
+        }
+        for n in [0, 9, -1, 1000] {
+            assert!(validate_rclone_transfers(Some(n)).is_err(), "{} should be rejected", n);
+        }
+    }
 }

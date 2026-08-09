@@ -51,7 +51,7 @@ fn get_projects_status() -> Vec<ProjectStatus> {
             result.push(ProjectStatus {
                 name: p.name.clone(),
                 local_path: p.local_path.clone(),
-                remote_path: p.remote_path.clone(),
+                remote_path: cfg.project_remote_path(p),
                 remote,
                 exists_locally: true,
             });
@@ -69,10 +69,17 @@ fn get_projects_status() -> Vec<ProjectStatus> {
                             continue;
                         }
                         seen.insert(name.to_string());
-                        result.push(ProjectStatus {
+                        let discovered = Project {
                             name: name.to_string(),
                             local_path: format!("{}/{}", dir, name),
-                            remote_path: format!("proj/{}", name),
+                            remote_path: String::new(),
+                            remote: default_remote.clone(),
+                            excludes: Vec::new(),
+                        };
+                        result.push(ProjectStatus {
+                            name: discovered.name.clone(),
+                            local_path: discovered.local_path.clone(),
+                            remote_path: cfg.project_remote_path(&discovered),
                             remote: default_remote.clone(),
                             exists_locally: true,
                         });
@@ -158,12 +165,23 @@ fn set_project_remote(
 }
 
 /// All rclone commands run in spawn_blocking and return their output as a string.
+/// Stop the in-flight operation for a project, killing rclone if it has already
+/// started. Returns false when there was nothing to stop.
+#[tauri::command]
+fn cancel_op(project_name: String) -> bool {
+    rclone::request_cancel(&project_name)
+}
 
+/// Every operation claims its project up front (so a cancel can reach it while
+/// it is still queued) and re-checks for a cancel after the queue lets it
+/// through (so a cancelled operation never spawns rclone at all).
 #[tauri::command]
 async fn push(project_name: String, dry_run: bool) -> Result<String, String> {
+    let _op = rclone::start_op(&project_name)?;
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
     let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
+    rclone::check_cancelled(&project_name)?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || sync_project(&cfg2, &proj2, "push", dry_run))
@@ -173,9 +191,11 @@ async fn push(project_name: String, dry_run: bool) -> Result<String, String> {
 
 #[tauri::command]
 async fn pull(project_name: String, dry_run: bool) -> Result<String, String> {
+    let _op = rclone::start_op(&project_name)?;
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
     let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
+    rclone::check_cancelled(&project_name)?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || sync_project(&cfg2, &proj2, "pull", dry_run))
@@ -184,10 +204,12 @@ async fn pull(project_name: String, dry_run: bool) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn check(project_name: String) -> Result<String, String> {
+async fn check(project_name: String) -> Result<rclone::CheckOutcome, String> {
+    let _op = rclone::start_op(&project_name)?;
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
     let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
+    rclone::check_cancelled(&project_name)?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || check_project(&cfg2, &proj2))
@@ -197,108 +219,16 @@ async fn check(project_name: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn bisync(project_name: String) -> Result<String, String> {
+    let _op = rclone::start_op(&project_name)?;
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
     let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
+    rclone::check_cancelled(&project_name)?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2))
         .await
         .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn push_all(dry_run: bool) -> Result<String, String> {
-    let cfg = load_config();
-    let mut all_output = String::new();
-    let projects: Vec<_> = cfg.projects.clone();
-
-    for project in &projects {
-        let expanded = expand_tilde(&project.local_path);
-        if !Path::new(&expanded).exists() {
-            continue;
-        }
-        let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
-        let cfg2 = cfg.clone();
-        let proj2 = project.clone();
-        match tokio::task::spawn_blocking(move || sync_project(&cfg2, &proj2, "push", dry_run))
-            .await
-        {
-            Ok(Ok(output)) => {
-                all_output.push_str(&format!("=== {} ===\n{}\n", project.name, output));
-            }
-            Ok(Err(e)) => {
-                all_output.push_str(&format!("=== {} ERROR ===\n{}\n", project.name, e));
-            }
-            Err(e) => {
-                all_output.push_str(&format!("=== {} FAILED ===\n{}\n", project.name, e));
-            }
-        }
-    }
-
-    Ok(all_output)
-}
-
-/// Bi-sync all configured projects
-#[tauri::command]
-async fn bisync_all() -> Result<String, String> {
-    let cfg = load_config();
-    let mut all_output = String::new();
-    let statuses = get_projects_status();
-
-    for ps in &statuses {
-        if !ps.exists_locally {
-            continue;
-        }
-        let project = match find_project(&cfg, &ps.name) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
-        let cfg2 = cfg.clone();
-        let proj2 = project.clone();
-        match tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2)).await {
-            Ok(Ok(output)) => {
-                all_output.push_str(&format!("=== {} ===\n{}\n", ps.name, output));
-            }
-            Ok(Err(e)) => {
-                all_output.push_str(&format!("=== {} ERROR ===\n{}\n", ps.name, e));
-            }
-            Err(e) => {
-                all_output.push_str(&format!("=== {} FAILED ===\n{}\n", ps.name, e));
-            }
-        }
-    }
-
-    Ok(all_output)
-}
-
-/// Check all local projects, return a map of name -> check output
-#[tauri::command]
-async fn check_all() -> Result<std::collections::HashMap<String, String>, String> {
-    let cfg = load_config();
-    let mut results = std::collections::HashMap::new();
-    let statuses = get_projects_status();
-
-    for ps in &statuses {
-        if !ps.exists_locally {
-            continue;
-        }
-        let project = match find_project(&cfg, &ps.name) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
-        let cfg2 = cfg.clone();
-        let proj2 = project.clone();
-        let name = ps.name.clone();
-        match tokio::task::spawn_blocking(move || check_project(&cfg2, &proj2)).await {
-            Ok(Ok(output)) => { results.insert(name, output); }
-            Ok(Err(e)) => { results.insert(name, format!("ERROR: {}", e)); }
-            Err(e) => { results.insert(name, format!("FAILED: {}", e)); }
-        }
-    }
-    Ok(results)
 }
 
 /// Delete local project directory AND remove it from config so a
@@ -357,6 +287,7 @@ fn check_local_exists(local_path: String) -> Result<bool, String> {
 
 #[tauri::command]
 async fn pull_new_project(name: String, local_path: String) -> Result<String, String> {
+    let _op = rclone::start_op(&name)?;
     let mut cfg = load_config();
 
     if local_dir_has_content(&local_path) {
@@ -367,18 +298,40 @@ async fn pull_new_project(name: String, local_path: String) -> Result<String, St
     }
 
     let expanded = expand_tilde(&local_path);
-    std::fs::create_dir_all(&expanded)
-        .map_err(|e| format!("Failed to create directory {expanded}: {e}"))?;
+
+    // Download into a dot-prefixed sibling, not the final path. An interrupted
+    // pull leaves a partial tree, and the default pull directory is normally
+    // also a scan directory — so a partial tree at the final path would be
+    // auto-discovered as an ordinary project, and the next Push would make the
+    // remote match that incomplete copy. `get_projects_status` skips names
+    // starting with '.', which is exactly the property needed here.
+    let staging = staging_path(&expanded)?;
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("Failed to create staging directory {staging}: {e}"))?;
+
+    // A project can already be configured yet have no local copy — that is
+    // exactly when Browse offers to pull it. Carry its excludes across so the
+    // pull applies the same filter policy its other operations do.
+    let existing_excludes = cfg
+        .projects
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.excludes.clone())
+        .unwrap_or_default();
 
     let project = Project {
         name: name.clone(),
-        local_path: local_path.clone(),
-        remote_path: format!("proj/{name}"),
-        remote: cfg.remote.clone(), // Use the active remote at time of pull
-        excludes: Vec::new(),
+        local_path: staging.clone(),
+        // Empty, so `remote_path_for_project` resolves the remote's configured
+        // base_path. Hardcoding "proj/" pulled from the wrong place on any
+        // remote whose base_path is not "proj" — which Browse itself lists from.
+        remote_path: String::new(),
+        remote: cfg.remote.clone(), // Browse switches the active remote on select
+        excludes: existing_excludes,
     };
 
     let _permit = rclone_semaphore().acquire().await.map_err(|_| "Operation queue closed".to_string())?;
+    rclone::check_cancelled(&name)?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
     let output =
@@ -386,10 +339,41 @@ async fn pull_new_project(name: String, local_path: String) -> Result<String, St
             .await
             .map_err(|e| e.to_string())??;
 
-    cfg.projects.push(project);
+    // Only a complete pull becomes a real project. Re-running Pull re-uses the
+    // staging directory, so an interrupted download resumes rather than
+    // restarting — rclone skips what already matches.
+    std::fs::rename(&staging, &expanded)
+        .map_err(|e| format!("Pulled to {staging} but could not move it to {expanded}: {e}"))?;
+
+    let record = Project {
+        local_path,
+        remote_path: String::new(),
+        ..project
+    };
+    // Replace, don't append. Pushing a second record with the same name left the
+    // stale one first in the list, and `find_project` returns the first match —
+    // so every later operation resolved the old, missing local path.
+    match cfg.projects.iter_mut().find(|p| p.name == record.name) {
+        Some(slot) => *slot = record,
+        None => cfg.projects.push(record),
+    }
     save_config(&cfg)?;
 
     Ok(output)
+}
+
+/// Sibling staging directory for an in-progress pull: `<parent>/.rcsync-partial-<name>`.
+fn staging_path(final_path: &str) -> Result<String, String> {
+    let p = Path::new(final_path);
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("Cannot derive a staging directory for '{}'", final_path))?;
+    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent
+        .join(format!(".rcsync-partial-{}", name))
+        .to_string_lossy()
+        .to_string())
 }
 
 #[tauri::command]
@@ -416,21 +400,16 @@ fn find_project(cfg: &AppConfig, name: &str) -> Result<Project, String> {
         return Ok(Project {
             name: name.to_string(),
             local_path,
-            remote_path: format!("proj/{}", name),
+            // Empty, so `remote_path_for_project` applies the remote's configured
+            // base_path. Hardcoding "proj/" sent every operation on a
+            // scan-discovered project to the wrong tree whenever base_path was
+            // anything else — and Push would then overwrite whatever lived there.
+            remote_path: String::new(),
             remote: cfg.default_remote_name(),
             excludes: Vec::new(),
         });
     }
     Err(format!("Project '{}' not found", name))
-}
-
-/// Find project, but override its remote with a specific one
-fn find_project_with_remote(cfg: &AppConfig, name: &str, remote: &str) -> Result<Project, String> {
-    let mut p = find_project(cfg, name)?;
-    if !remote.is_empty() {
-        p.remote = remote.to_string();
-    }
-    Ok(p)
 }
 
 /// Try to raise the open-file-descriptor soft limit so rclone processes
@@ -476,9 +455,7 @@ pub fn run() {
             pull,
             check,
             bisync,
-            push_all,
-            bisync_all,
-            check_all,
+            cancel_op,
             delete_local,
             open_folder,
             browse_remote,
