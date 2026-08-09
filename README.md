@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo-transparent.png" width="120" alt="rcsync logo" />
+  <img src="assets/logo-transparent.png" width="120" alt="rcsync logo" />
 </p>
 
 <h1 align="center">rcsync</h1>
@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshot.png" width="720" alt="rcsync dashboard" />
+  <img src="assets/screenshot.png" width="720" alt="rcsync dashboard" />
 </p>
 
 ---
@@ -163,6 +163,23 @@ Default excludes are always applied. `extra_excludes` adds your own patterns on 
 | `remotes` | rcsync-config.json | Available remotes with their base paths |
 | `scan_dirs` | rcsync-config.json | Local directories to scan for project folders |
 | `auto_check_on_launch` | rcsync-config.json | Run Check All when the app opens |
+| `rclone_transfers` | rcsync-config.json | Files transferred in parallel per rclone process. Omit for Automatic (rclone's own setting); 1–8 otherwise |
+
+### Supported rclone configuration
+
+rcsync refuses to push a project whose source rclone considers empty, because
+`rclone sync` makes the destination match the source — an empty source would delete
+the remote copy. That guard works by asking rclone itself, with the same exclude
+arguments the push will use. Two boundaries follow from how it works:
+
+- **Don't modify a project while it is being pushed.** The check and the sync are two
+  rclone invocations. A source emptied between them can still be synced as empty.
+- **Remote-level `global.*` overrides in your rclone config are not supported.** The
+  guard inspects a local path, so a remote that rewrites sync or filter behaviour when
+  it is instantiated would affect the push without affecting the check.
+
+Ordinary rclone remotes — including anything configured through `rclone config` in the
+normal way — are unaffected by either.
 
 ### Adding a new remote
 

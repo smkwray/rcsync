@@ -20,7 +20,37 @@ rcsync-config-*.json
 # Claude Code
 .claude/
 
-# Generated icons source
-app-icon-square.png
-Gemini_Generated_Image_*
-Screenshot*
+# Local working notes and tooling — not part of the published project
+do/
+CLAUDE.md
+AGENTS.md
+scripts/
+.githooks/
+
+# Syncthing artifacts (this tree is synced between machines)
+*.sync-conflict-*
+.syncthing.*
+
+# Local notes (published README images live in assets/)
+docs/
+
+# Environment
+.env
+
+# Plans
+*.plan.md
+plan.md
+plans/
+
+# Python artifacts
+__pycache__/
+.pytest_cache/
+
+# Stray source images and build output at the repo root. Anchored with a
+# leading slash: unanchored patterns match at any depth, and "Screenshot*"
+# was matching assets/screenshot.png, which the README embeds.
+/app-icon-square.png
+/app-icon-rounded.png
+/Gemini_Generated_Image_*
+/Screenshot*
+/dist-windows/
