@@ -114,6 +114,28 @@
           <input type="checkbox" bind:checked={startAtLogin} onchange={toggleAutostart} />
           Start at login
         </label>
+        <label class="field">
+          <span>Parallel file transfers</span>
+          <input
+            type="number"
+            min="1"
+            max="8"
+            placeholder="Automatic"
+            value={editConfig.rclone_transfers ?? ""}
+            oninput={(e) => {
+              // Blank must stay null, never a substituted number: passing an
+              // explicit value would override the user's own rclone config or
+              // RCLONE_TRANSFERS, since a command-line flag outranks both.
+              const raw = (e.currentTarget as HTMLInputElement).value.trim();
+              editConfig.rclone_transfers = raw === "" ? null : Number(raw);
+            }}
+          />
+        </label>
+        <p class="section-desc">
+          Files rclone uploads at once, per project. Blank leaves rclone's own setting alone.
+          1&ndash;8; up to three projects can sync at the same time, so memory use is roughly
+          this figure times three.
+        </p>
       </section>
 
       <section>

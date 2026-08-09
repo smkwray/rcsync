@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import type { AppConfig, Project, ProjectStatus, SyncMode } from "./types";
+  import type { AppConfig, BulkMode, CheckOutcome, CheckStatus, Project, ProjectStatus, SyncMode, SyncState } from "./types";
   import ProjectCard from "./ProjectCard.svelte";
   import LogOutput from "./LogOutput.svelte";
   import ShortcutsHelp from "./ShortcutsHelp.svelte";
@@ -10,9 +10,7 @@
   let projects: ProjectStatus[] = $state([]);
   let logLines: string[] = $state([]);
   let runningProjects: Map<string, string> = $state(new Map()); // name -> mode
-  let pushingAll = $state(false);
-  let bisyncingAll = $state(false);
-  let checkingAll = $state(false);
+  let cancellingProjects: Set<string> = $state(new Set());
   let loaded = $state(false);
   let search = $state("");
   let selectedIndex = $state(-1);
@@ -34,16 +32,26 @@
   function onConfirmYes() { confirmState?.resolve(true); confirmState = null; }
   function onConfirmNo() { confirmState?.resolve(false); confirmState = null; }
 
-  let checkStatuses: Record<string, { time: string; synced: boolean; diffs: number }> = $state(
-    JSON.parse(localStorage.getItem("rcsync-check-statuses") || "{}")
+  // Key bumped to v2 with the shape change: the old {synced, diffs} entries are a
+  // cache any Check rebuilds, so they are dropped rather than migrated.
+  let checkStatuses: Record<string, CheckStatus> = $state(
+    JSON.parse(localStorage.getItem("rcsync-check-statuses-v2") || "{}")
   );
+
+  function setStatus(name: string, state: SyncState, diffs = 0) {
+    checkStatuses = { ...checkStatuses, [name]: { time: shortTime(), state, diffs } };
+  }
+
+  function applyCheckOutcome(name: string, outcome: CheckOutcome) {
+    setStatus(name, outcome.synced ? "synced" : "diffs", outcome.differences);
+  }
 
   // Pinned projects (stored by name)
   let pinnedNames: string[] = $state(
     JSON.parse(localStorage.getItem("rcsync-pinned") || "[]")
   );
 
-  $effect(() => { localStorage.setItem("rcsync-check-statuses", JSON.stringify(checkStatuses)); });
+  $effect(() => { localStorage.setItem("rcsync-check-statuses-v2", JSON.stringify(checkStatuses)); });
   $effect(() => { localStorage.setItem("rcsync-shortcuts", String(shortcutsEnabled)); });
   $effect(() => { localStorage.setItem("rcsync-pinned", JSON.stringify(pinnedNames)); });
 
@@ -55,6 +63,7 @@
   });
 
   let localProjects = $derived(projects.filter((p) => p.exists_locally));
+  let anyRunning = $derived(runningProjects.size > 0 || bulkMode !== null);
 
   // Sort: pinned first, then alphabetical
   let sortedProjects = $derived(() => {
@@ -84,12 +93,6 @@
     return `${d.getMonth()+1}/${d.getDate()} ${h%12||12}:${m}${h>=12?"p":"a"}`;
   }
 
-  function parseCheckResult(output: string): { synced: boolean; diffs: number } {
-    const m = output.match(/(\d+) differences/);
-    if (m) return { synced: false, diffs: parseInt(m[1]) };
-    return { synced: true, diffs: 0 };
-  }
-
   function getGridCols(): number {
     if (!gridEl) return 2;
     return getComputedStyle(gridEl).gridTemplateColumns.split(" ").length;
@@ -106,9 +109,16 @@
     return filteredProjects[selectedIndex];
   }
 
+  // "On launch" means once. Reloading the list after Settings or Browse closes
+  // goes through here too, and previously each one kicked off another silent
+  // check of every project.
+  let didAutoCheck = false;
+
   async function loadProjects() {
     projects = await invoke<ProjectStatus[]>("get_projects_status");
     loaded = true;
+    if (didAutoCheck) return;
+    didAutoCheck = true;
     try {
       const cfg = await invoke<AppConfig>("get_config");
       if (cfg.auto_check_on_launch) runCheckAll(true);
@@ -128,6 +138,61 @@
     const m = new Map(runningProjects);
     m.delete(name);
     runningProjects = m;
+    if (cancellingProjects.has(name)) {
+      const c = new Set(cancellingProjects);
+      c.delete(name);
+      cancellingProjects = c;
+    }
+  }
+
+  /** The backend returns exactly this when the user stopped an operation. */
+  function isCancelled(e: unknown): boolean {
+    return String(e) === "CANCELLED";
+  }
+
+  /** Report a failed operation, distinguishing a deliberate cancel from a real
+   *  error. Either way the card must stop showing a verdict it no longer has
+   *  grounds for: a stopped push/pull/bisync moved an unknown subset of files,
+   *  and a failed operation means the last verdict rested on a run that has
+   *  since failed. Leaving the old badge up is the dishonest option. */
+  function noteFailure(name: string, mode: SyncMode, e: unknown, log = true) {
+    if (!isCancelled(e)) {
+      if (log) logLines = [...logLines, `[${name}] ERROR: ${e}`];
+      // Always, even for a silent launch check: the badge on screen was earned
+      // by a run that has now failed, so it has to be withdrawn. Suppressing
+      // this with the log was how an expired token left a project reading
+      // "synced" after the app had just failed to verify it.
+      setStatus(name, "unknown");
+      return;
+    }
+    if (log) logLines = [...logLines, `[${name}] Cancelled.`];
+    if (mode === "push" || mode === "pull" || mode === "bisync") {
+      setStatus(name, "modified", -1);
+    }
+    if (mode === "bisync" && log) {
+      logLines = [...logLines, `[${name}] NOTE: an interrupted bi-sync leaves rclone's listings stale — the next bi-sync will likely need --resync.`];
+    }
+  }
+
+  async function handleCancel(project: Project) {
+    if (!runningProjects.has(project.name) || cancellingProjects.has(project.name)) return;
+    cancellingProjects = new Set([...cancellingProjects, project.name]);
+    logLines = [...logLines, `[${project.name}] Stopping ${runningProjects.get(project.name)}...`];
+    await invoke("cancel_op", { projectName: project.name });
+  }
+
+  /** Stop everything in flight. Deliberately unlabelled with a count: during a
+   *  "push all" only a few projects are actually running, but this also stops
+   *  the many still queued behind them. */
+  async function cancelAll() {
+    if (!anyRunning) return;
+    // Cancels only the run that is actually in flight — a later run gets its own
+    // token and is unaffected.
+    if (activeBulk) activeBulk.cancelled = true;
+    const names = [...runningProjects.keys()];
+    logLines = [...logLines, "--- CANCEL ALL ---"];
+    cancellingProjects = new Set([...cancellingProjects, ...names]);
+    await Promise.all(names.map((n) => invoke("cancel_op", { projectName: n })));
   }
 
   function togglePin(project: Project) {
@@ -177,17 +242,18 @@
       } else if (mode === "bisync") {
         result = await invoke<string>("bisync", { projectName: project.name });
       } else if (mode === "check") {
-        result = await invoke<string>("check", { projectName: project.name });
-        checkStatuses = { ...checkStatuses, [project.name]: { time: shortTime(), ...parseCheckResult(result) } };
+        const outcome = await invoke<CheckOutcome>("check", { projectName: project.name });
+        applyCheckOutcome(project.name, outcome);
+        result = outcome.details;
       }
       if (result) addLog(project.name, result);
       logLines = [...logLines, `[${project.name}] Done.`];
       // After successful push/pull/bisync, mark as synced
       if (mode === "push" || mode === "pull" || mode === "bisync") {
-        checkStatuses = { ...checkStatuses, [project.name]: { time: shortTime(), synced: true, diffs: 0 } };
+        setStatus(project.name, "synced");
       }
     } catch (e) {
-      logLines = [...logLines, `[${project.name}] ERROR: ${e}`];
+      noteFailure(project.name, mode, e);
     }
     markDone(project.name);
   }
@@ -217,36 +283,101 @@
     }
   }
 
-  // Parallel check all — runs up to 4 checks concurrently
-  async function runCheckAll(silent = false) {
-    checkingAll = true;
-    if (!silent) logLines = [...logLines, "--- CHECK ALL ---"];
+  /** The one bulk coordinator.
+   *
+   *  Each mode used to have its own boolean and all three shared a single
+   *  `bulkCancelled` that every entry point reset to `false` — so starting any
+   *  bulk run un-cancelled one that was still winding down, and it resumed.
+   *  A run now carries its own token, and only that token can be cancelled.
+   *  Control-flow state is a plain object, not `$state`: the loop closes over it
+   *  and has to observe the mutation directly. */
+  const BULK: Record<BulkMode, {
+    title: string;
+    concurrency: number;
+    verb: string;
+    run: (name: string) => Promise<string>;
+    onSuccess: (name: string, result: string, silent: boolean) => void;
+  }> = {
+    check: {
+      title: "Check all", concurrency: 4, verb: "checked",
+      run: async (name) => {
+        const outcome = await invoke<CheckOutcome>("check", { projectName: name });
+        applyCheckOutcome(name, outcome);
+        return outcome.details;
+      },
+      onSuccess(name, details, silent) {
+        if (!silent) addLog(name, details);
+      },
+    },
+    push: {
+      title: "Push all", concurrency: 3, verb: "pushed",
+      run: (name) => invoke<string>("push", { projectName: name, dryRun: false }),
+      onSuccess: (name, result) => noteSuccess(name, result),
+    },
+    bisync: {
+      title: "Bi-sync all", concurrency: 3, verb: "bi-synced",
+      run: (name) => invoke<string>("bisync", { projectName: name }),
+      onSuccess: (name, result) => noteSuccess(name, result),
+    },
+  };
 
-    const CONCURRENCY = 4;
+  function noteSuccess(name: string, result: string) {
+    if (result) addLog(name, result);
+    logLines = [...logLines, `[${name}] Done.`];
+    setStatus(name, "synced");
+  }
+
+  let activeBulk: { id: number; mode: BulkMode; cancelled: boolean } | null = null;
+  let bulkMode: BulkMode | null = $state(null); // mirror of activeBulk, for the UI only
+  let nextBulkId = 0;
+
+  async function runBulk(mode: BulkMode, silent = false) {
+    if (activeBulk) {
+      if (!silent) logLines = [...logLines, `Skipped ${BULK[mode].title} — ${BULK[activeBulk.mode].title} is still running.`];
+      return;
+    }
+    const run = { id: ++nextBulkId, mode, cancelled: false };
+    activeBulk = run;
+    bulkMode = mode;
+
+    const spec = BULK[mode];
+    if (!silent) logLines = [...logLines, `--- ${spec.title.toUpperCase()} ---`];
+
     const queue = [...localProjects];
+    let skipped = 0;
 
-    async function checkOne(ps: ProjectStatus) {
-      if (runningProjects.has(ps.name)) return;
-      markRunning(ps.name, "check");
+    async function one(ps: ProjectStatus) {
+      // Busy with a manual operation. Counted rather than ignored, so the
+      // summary below can never call a run complete that silently passed
+      // projects over.
+      if (runningProjects.has(ps.name)) { skipped++; return; }
+      markRunning(ps.name, mode);
       try {
-        const result = await invoke<string>("check", { projectName: ps.name });
-        checkStatuses = { ...checkStatuses, [ps.name]: { time: shortTime(), ...parseCheckResult(result) } };
-        if (!silent) addLog(ps.name, result);
+        spec.onSuccess(ps.name, await spec.run(ps.name), silent);
       } catch (e) {
-        if (!silent) logLines = [...logLines, `[${ps.name}] ERROR: ${e}`];
+        noteFailure(ps.name, mode, e, !silent);
       }
       markDone(ps.name);
     }
 
-    // Process in batches of CONCURRENCY
-    while (queue.length > 0) {
-      const batch = queue.splice(0, CONCURRENCY);
-      await Promise.all(batch.map(checkOne));
+    try {
+      while (queue.length > 0 && !run.cancelled) {
+        await Promise.all(queue.splice(0, spec.concurrency).map(one));
+      }
+    } finally {
+      if (activeBulk?.id === run.id) { activeBulk = null; bulkMode = null; }
     }
 
-    if (!silent) logLines = [...logLines, "Check all complete."];
-    checkingAll = false;
+    if (!silent) {
+      const notes: string[] = [];
+      if (queue.length > 0) notes.push(`${queue.length} not ${spec.verb}`);
+      if (skipped > 0) notes.push(`${skipped} skipped (already running)`);
+      const head = run.cancelled ? `${spec.title} cancelled` : `${spec.title} complete`;
+      logLines = [...logLines, notes.length ? `${head} — ${notes.join(", ")}.` : `${head}.`];
+    }
   }
+
+  const runCheckAll = (silent = false) => runBulk("check", silent);
 
   async function handlePushAll() {
     const count = localProjects.length;
@@ -256,35 +387,7 @@
       "Push All",
       false,
     );
-    if (!ok) return;
-
-    pushingAll = true;
-    logLines = [...logLines, "--- PUSH ALL ---"];
-
-    const CONCURRENCY = 3;
-    const queue = [...localProjects];
-
-    async function pushOne(ps: ProjectStatus) {
-      if (runningProjects.has(ps.name)) return;
-      markRunning(ps.name, "push");
-      try {
-        const result = await invoke<string>("push", { projectName: ps.name, dryRun: false });
-        if (result) addLog(ps.name, result);
-        logLines = [...logLines, `[${ps.name}] Done.`];
-        checkStatuses = { ...checkStatuses, [ps.name]: { time: shortTime(), synced: true, diffs: 0 } };
-      } catch (e) {
-        logLines = [...logLines, `[${ps.name}] ERROR: ${e}`];
-      }
-      markDone(ps.name);
-    }
-
-    while (queue.length > 0) {
-      const batch = queue.splice(0, CONCURRENCY);
-      await Promise.all(batch.map(pushOne));
-    }
-
-    logLines = [...logLines, "Push all complete."];
-    pushingAll = false;
+    if (ok) runBulk("push");
   }
 
   async function handleBisyncAll() {
@@ -294,35 +397,7 @@
       `Two-way sync all ${count} local projects with their remotes.\nChanges on both sides will be merged. Conflicts may arise.`,
       "Bi-Sync All",
     );
-    if (!ok) return;
-
-    bisyncingAll = true;
-    logLines = [...logLines, "--- BI-SYNC ALL ---"];
-
-    const CONCURRENCY = 3;
-    const queue = [...localProjects];
-
-    async function bisyncOne(ps: ProjectStatus) {
-      if (runningProjects.has(ps.name)) return;
-      markRunning(ps.name, "bisync");
-      try {
-        const result = await invoke<string>("bisync", { projectName: ps.name });
-        if (result) addLog(ps.name, result);
-        logLines = [...logLines, `[${ps.name}] Done.`];
-        checkStatuses = { ...checkStatuses, [ps.name]: { time: shortTime(), synced: true, diffs: 0 } };
-      } catch (e) {
-        logLines = [...logLines, `[${ps.name}] ERROR: ${e}`];
-      }
-      markDone(ps.name);
-    }
-
-    while (queue.length > 0) {
-      const batch = queue.splice(0, CONCURRENCY);
-      await Promise.all(batch.map(bisyncOne));
-    }
-
-    logLines = [...logLines, "Bi-sync all complete."];
-    bisyncingAll = false;
+    if (ok) runBulk("bisync");
   }
 
   function clearLog() { logLines = []; }
@@ -340,6 +415,10 @@
       return;
     }
 
+    // The macOS stop chord, always live. Deliberately not Escape, which already
+    // means "deselect / close" — killing a sync by reflex would be worse than
+    // having to learn one key.
+    if (e.metaKey && e.key === ".") { e.preventDefault(); cancelAll(); return; }
     if (e.metaKey && e.key === ",") { e.preventDefault(); window.dispatchEvent(new CustomEvent("open-settings")); return; }
     if (e.metaKey && e.key === "k") { e.preventDefault(); toggleShortcuts(); return; }
     if (e.metaKey && e.key === "o") { e.preventDefault(); toggleOutput(); return; }
@@ -391,10 +470,11 @@
       case "h": { const s = ensureSelected(); if (s) handleDelete(toProject(s)); } break;
       case "e": { const s = ensureSelected(); if (s) invoke("open_folder", { localPath: s.local_path }); } break;
       case "i": { const s = ensureSelected(); if (s) togglePin(toProject(s)); } break;
+      case "q": { const s = ensureSelected(); if (s) handleCancel(toProject(s)); } break;
       case "/": e.preventDefault(); filterInput?.focus(); break;
-      case "c": if (!checkingAll) runCheckAll(); break;
-      case "p": if (!pushingAll) handlePushAll(); break;
-      case "v": if (!bisyncingAll) handleBisyncAll(); break;
+      case "c": if (!bulkMode) runCheckAll(); break;
+      case "p": if (!bulkMode) handlePushAll(); break;
+      case "v": if (!bulkMode) handleBisyncAll(); break;
       case "x": clearLog(); break;
       case "o": toggleOutput(); break;
       case "b": window.dispatchEvent(new CustomEvent("open-browse")); break;
@@ -403,16 +483,40 @@
 
   loadProjects();
 
-  // Listen for local file changes from the watcher and invalidate sync status
-  listen<{ projects: string[] }>("file-change", (event) => {
-    const changed = event.payload.projects;
-    const updated = { ...checkStatuses };
-    for (const name of changed) {
-      if (updated[name]?.synced) {
-        updated[name] = { ...updated[name], synced: false, diffs: -1 };
+  // Reloading the project list is how App asks for a refresh after Settings or
+  // Browse closes. It deliberately does NOT touch runningProjects — an operation
+  // in flight has to stay visible and cancellable across an overlay.
+  function onReloadProjects() {
+    loadProjects();
+  }
+
+  $effect(() => {
+    window.addEventListener("reload-projects", onReloadProjects);
+
+    // Retain the unlisten handle: without it every listener outlived its
+    // component and the handlers stacked up. `disposed` covers teardown landing
+    // before the async registration resolves.
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    listen<{ projects: string[] }>("file-change", (event) => {
+      const changed = event.payload.projects;
+      const updated = { ...checkStatuses };
+      for (const name of changed) {
+        if (updated[name]?.state === "synced") {
+          updated[name] = { ...updated[name], state: "modified", diffs: -1 };
+        }
       }
-    }
-    checkStatuses = updated;
+      checkStatuses = updated;
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("reload-projects", onReloadProjects);
+      unlisten?.();
+    };
   });
 </script>
 
@@ -434,15 +538,23 @@
         <input type="checkbox" bind:checked={shortcutsEnabled} />
         <span class="shortcuts-label">Keys</span>
       </label>
-      <button disabled={checkingAll || !loaded} onclick={() => runCheckAll()}>
-        {checkingAll ? "Checking..." : "Check All"}
+      <!-- All three lock while any bulk run is active: they share the project
+           set, so overlapping runs skip each other's projects and confuse the
+           completion summary. -->
+      <button disabled={bulkMode !== null || !loaded} onclick={() => runCheckAll()}>
+        {bulkMode === "check" ? "Checking..." : "Check All"}
       </button>
-      <button class="primary" disabled={pushingAll || !loaded || localProjects.length === 0} onclick={handlePushAll}>
-        Push All
+      <button class="primary" disabled={bulkMode !== null || !loaded || localProjects.length === 0} onclick={handlePushAll}>
+        {bulkMode === "push" ? "Pushing..." : "Push All"}
       </button>
-      <button class="warn" disabled={bisyncingAll || !loaded || localProjects.length === 0} onclick={handleBisyncAll}>
-        {bisyncingAll ? "Bi-Syncing..." : "Bi-Sync All"}
+      <button class="warn" disabled={bulkMode !== null || !loaded || localProjects.length === 0} onclick={handleBisyncAll}>
+        {bulkMode === "bisync" ? "Bi-Syncing..." : "Bi-Sync All"}
       </button>
+      {#if anyRunning}
+        <button class="cancel-all" onclick={cancelAll} title="Stop everything running and queued (Cmd+.)">
+          Cancel All
+        </button>
+      {/if}
       <button onclick={toggleOutput} title="Cmd+O">{showOutput ? "Hide Log" : "Show Log"}</button>
       <button onclick={clearLog}>Clear</button>
     </div>
@@ -463,9 +575,11 @@
               project={toProject(project)}
               running={runningProjects.has(project.name)}
               runningMode={runningProjects.get(project.name) ?? ""}
+              cancelling={cancellingProjects.has(project.name)}
               checkStatus={checkStatuses[project.name] ?? null}
               pinned={pinnedNames.includes(project.name)}
               onaction={handleAction}
+              oncancel={handleCancel}
               ondelete={handleDelete}
               onpin={togglePin}
               onupdated={loadProjects}
@@ -535,4 +649,6 @@
   .loading { color: var(--text-muted); font-style: italic; }
   button.warn { border-color: var(--yellow); color: var(--yellow); }
   button.warn:hover { background: var(--yellow-dim); }
+  .cancel-all { border-color: var(--red); background: var(--red-dim); color: var(--red); font-weight: 600; }
+  .cancel-all:hover { background: var(--red); color: var(--bg); }
 </style>

@@ -24,10 +24,19 @@
     showSettings = true;
   }
 
+  // Closing an overlay asks the Dashboard to reload; it must never remount it.
+  // Remounting discarded every in-flight operation's state — the running set,
+  // the Cancel button, the bulk-run state — while rclone kept going, leaving a
+  // sync that could not be seen or stopped and a badge that could still read
+  // "synced" from localStorage.
+  function reloadDashboard() {
+    window.dispatchEvent(new CustomEvent("reload-projects"));
+  }
+
   function closeSettings() {
     showSettings = false;
     settingsConfig = null;
-    dashboardKey = {};
+    reloadDashboard();
   }
 
   function openBrowse() {
@@ -36,10 +45,8 @@
 
   function closeBrowse() {
     showBrowse = false;
-    dashboardKey = {};
+    reloadDashboard();
   }
-
-  let dashboardKey = $state({});
 
   // Listen for keyboard shortcut events from Dashboard
   if (typeof window !== "undefined") {
@@ -75,9 +82,7 @@
     </div>
   </nav>
 
-  {#key dashboardKey}
-    <Dashboard />
-  {/key}
+  <Dashboard />
 
   {#if showSettings && settingsConfig}
     <Settings config={settingsConfig} onclose={closeSettings} />
