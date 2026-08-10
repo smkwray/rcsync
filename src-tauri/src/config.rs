@@ -2,6 +2,55 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+static TEST_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialises tests that redirect the process-wide config path, restores any
+/// pre-existing override even during unwinding, and removes only the scratch
+/// file it created. Keeping this guard shared across test modules matters:
+/// independent locks still race on the same environment variable.
+#[cfg(test)]
+pub(crate) struct TestConfigEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    path: PathBuf,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestConfigEnv {
+    pub(crate) fn new(label: &str) -> Self {
+        let lock = TEST_CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "rcsync-{}-{}-{}.json",
+            label,
+            std::process::id(),
+            nonce
+        ));
+        let previous = std::env::var_os("RCSYNC_CONFIG");
+        std::env::set_var("RCSYNC_CONFIG", &path);
+        Self {
+            _lock: lock,
+            path,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestConfigEnv {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        match self.previous.take() {
+            Some(value) => std::env::set_var("RCSYNC_CONFIG", value),
+            None => std::env::remove_var("RCSYNC_CONFIG"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -558,26 +607,6 @@ mod tests {
         }
     }
 
-    /// Point config reads and writes at a scratch file. Without this a failing
-    /// assertion below would let `save_config` overwrite the real user config
-    /// with a default one — a test that can destroy the thing it is testing.
-    /// The env var is process-wide, so every test that writes config must go
-    /// through here and they must not run concurrently with each other.
-    fn with_scratch_config<T>(body: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let path = std::env::temp_dir().join(format!(
-            "rcsync-cfg-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::env::set_var("RCSYNC_CONFIG", &path);
-        let out = body();
-        let _ = fs::remove_file(&path);
-        std::env::remove_var("RCSYNC_CONFIG");
-        out
-    }
-
     fn cfg_with_excludes(extra: Vec<&str>, project: Vec<&str>) -> AppConfig {
         AppConfig {
             remote: "gdrive".into(),
@@ -601,22 +630,31 @@ mod tests {
     /// only for configs nobody edited by hand.
     #[test]
     fn saving_a_config_refuses_patterns_that_the_two_filter_forms_read_differently() {
-        with_scratch_config(|| {
-            for bad in DIVERGENT {
-                assert!(
-                    save_config(&cfg_with_excludes(vec![bad], vec![])).is_err(),
-                    "{:?} must be refused when saved, not repaired into agreement",
-                    bad
-                );
-                assert!(
-                    save_config(&cfg_with_excludes(vec![], vec![bad])).is_err(),
-                    "{:?} must be refused on a project too",
-                    bad
-                );
-            }
-            // A clean set still saves, so the rule is not simply refusing everything.
-            assert!(save_config(&cfg_with_excludes(vec!["node_modules/**"], vec!["artifacts/**"])).is_ok());
-        });
+        let _env = TestConfigEnv::new("save-validation");
+        for bad in DIVERGENT {
+            assert!(
+                save_config(&cfg_with_excludes(vec![bad], vec![])).is_err(),
+                "{:?} must be refused when saved, not repaired into agreement",
+                bad
+            );
+            assert!(
+                save_config(&cfg_with_excludes(vec![], vec![bad])).is_err(),
+                "{:?} must be refused on a project too",
+                bad
+            );
+        }
+
+        // A clean set must make it through the real serializer and come back
+        // byte-for-byte, so an unrelated write failure cannot make every bad
+        // case above look correctly rejected.
+        save_config(&cfg_with_excludes(
+            vec!["node_modules/**"],
+            vec!["artifacts/**"],
+        ))
+        .unwrap();
+        let loaded = load_config();
+        assert_eq!(loaded.extra_excludes, vec!["node_modules/**"]);
+        assert_eq!(loaded.projects[0].excludes, vec!["artifacts/**"]);
     }
 
     #[test]
