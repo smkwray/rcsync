@@ -183,20 +183,44 @@ fn format_progress(stats: &serde_json::Value) -> String {
     let num = |k: &str| stats.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
     let mut parts: Vec<String> = Vec::new();
 
+    // Every total here counts only what rclone's listing has found SO FAR, and
+    // on a large remote that listing runs for minutes. So "100%" against a
+    // partial denominator does not mean finished — it means caught up with
+    // discovery, while discovery continues. Reported as 100% with `ETA 0s` it
+    // read as a completed push that had in fact copied 14 files of 17,000.
+    //
+    // The row is only ever on screen while the process is alive, so whenever
+    // everything currently known is done, the honest thing to show is what the
+    // scan has reached rather than a percentage of an unfinished question.
+    let (transfers, total_transfers) = (num("transfers"), num("totalTransfers"));
+    let caught_up_with_discovery = total_transfers > 0.0 && transfers >= total_transfers;
+
     let (bytes, total_bytes) = (num("bytes"), num("totalBytes"));
     if total_bytes > 0.0 {
         parts.push(format!("{} / {}", human_bytes(bytes), human_bytes(total_bytes)));
-        parts.push(format!("{:.0}%", bytes / total_bytes * 100.0));
+        if !caught_up_with_discovery {
+            parts.push(format!("{:.0}%", bytes / total_bytes * 100.0));
+        }
     }
     if num("speed") > 0.0 {
         parts.push(format!("{}/s", human_bytes(num("speed"))));
     }
     // Null once nothing is left to estimate, which is not the same as zero.
-    if let Some(eta) = stats.get("eta").and_then(serde_json::Value::as_f64) {
-        parts.push(format!("ETA {}", human_duration(eta)));
+    if !caught_up_with_discovery {
+        if let Some(eta) = stats.get("eta").and_then(serde_json::Value::as_f64) {
+            parts.push(format!("ETA {}", human_duration(eta)));
+        }
     }
-    if num("totalTransfers") > 0.0 {
-        parts.push(format!("{} / {} files", num("transfers") as i64, num("totalTransfers") as i64));
+    if total_transfers > 0.0 {
+        parts.push(format!("{} / {} files", transfers as i64, total_transfers as i64));
+    }
+    if caught_up_with_discovery {
+        let listed = num("listed") as i64;
+        parts.push(if listed > 0 {
+            format!("still scanning — {} listed", listed)
+        } else {
+            "still scanning".to_string()
+        });
     }
     if num("totalChecks") > 0.0 {
         parts.push(format!("{} / {} checked", num("checks") as i64, num("totalChecks") as i64));
@@ -2348,16 +2372,42 @@ esac
         );
     }
 
+    /// The screenshot that forced this: a push 14 files into a 17,000-file tree
+    /// reported `174.45 KiB / 174.45 KiB · 100% · ETA 0s · 14 / 14 files`. Every
+    /// total counts only what the listing has found so far, so a percentage
+    /// against it claims a completion that has not happened.
+    #[test]
+    fn being_caught_up_with_an_unfinished_scan_is_not_reported_as_finished() {
+        let caught_up = progress_of(&stats_record(
+            "\"bytes\":178636,\"totalBytes\":178636,\"transfers\":14,\"totalTransfers\":14,\
+             \"eta\":0,\"listed\":119932",
+        ));
+        assert!(!caught_up.contains("100%"), "a partial denominator is not completion: {:?}", caught_up);
+        assert!(!caught_up.contains("ETA 0s"), "nor is an ETA over it: {:?}", caught_up);
+        assert!(caught_up.contains("14 / 14 files"), "what it HAS done still shows: {:?}", caught_up);
+        assert!(caught_up.contains("still scanning — 119932 listed"), "{:?}", caught_up);
+
+        // Mid-transfer, with work still outstanding, the percentage is real.
+        let working = progress_of(&stats_record(
+            "\"bytes\":50,\"totalBytes\":200,\"transfers\":3,\"totalTransfers\":12,\"eta\":90",
+        ));
+        assert!(working.contains("25%"), "{:?}", working);
+        assert!(working.contains("ETA 1m30s"), "{:?}", working);
+        assert!(!working.contains("still scanning"), "{:?}", working);
+    }
+
     #[test]
     fn a_stats_record_is_progress_and_never_a_log_line() {
         // The complaint that forced this: at 100% with nothing moving, every
         // heartbeat carried identical text, and appending them filled the panel
         // with page after page of the same line.
+        // Mid-transfer on purpose: a record where everything known is already
+        // done suppresses the percentage and ETA, which the caught-up test covers.
         let text = progress_of(&stats_record(
-            "\"bytes\":330079,\"totalBytes\":330079,\"speed\":9198.0,\"eta\":0,\
-             \"transfers\":12,\"totalTransfers\":12,\"errors\":4",
+            "\"bytes\":165040,\"totalBytes\":330079,\"speed\":9198.0,\"eta\":30,\
+             \"transfers\":9,\"totalTransfers\":12,\"errors\":4",
         ));
-        for expected in ["322.34 KiB / 322.34 KiB", "100%", "ETA 0s", "12 / 12 files", "4 errors"] {
+        for expected in ["161.17 KiB / 322.34 KiB", "50%", "ETA 30s", "9 / 12 files", "4 errors"] {
             assert!(text.contains(expected), "{:?} missing from {:?}", expected, text);
         }
     }
