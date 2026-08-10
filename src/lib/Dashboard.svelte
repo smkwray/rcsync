@@ -125,9 +125,34 @@
     } catch (_) {}
   }
 
+  /** The log is a live view, not an archive: one push of a source tree emits a
+   *  line per file, and every line is a DOM node. Past this many the oldest go —
+   *  but they are counted and said to be gone, because a log that quietly loses
+   *  its beginning is worse than one that admits it. */
+  const MAX_LOG_LINES = 4000;
+  /** Trim in chunks so a steady stream doesn't re-slice the array on every line. */
+  const TRIM_CHUNK = 500;
+  let droppedLines = 0;
+
+  function appendLog(...incoming: string[]) {
+    if (incoming.length === 0) return;
+    let next = [...logLines, ...incoming];
+    if (next.length > MAX_LOG_LINES) {
+      const cut = next.length - MAX_LOG_LINES + TRIM_CHUNK;
+      // The marker itself occupies index 0 once anything has been dropped, so it
+      // must not be counted as one of the lines this round removes.
+      droppedLines += droppedLines > 0 ? cut - 1 : cut;
+      next = [
+        `⋯ ${droppedLines} earlier lines dropped — the log keeps the last ${MAX_LOG_LINES}`,
+        ...next.slice(cut),
+      ];
+    }
+    logLines = next;
+  }
+
   function addLog(project: string, text: string) {
     const lines = text.split("\n").filter((l) => l.trim());
-    logLines = [...logLines, ...lines.map((l) => `[${project}] ${l}`)];
+    appendLog(...lines.map((l) => `[${project}] ${l}`));
   }
 
   function markRunning(name: string, mode: string) {
@@ -157,7 +182,10 @@
    *  since failed. Leaving the old badge up is the dishonest option. */
   function noteFailure(name: string, mode: SyncMode, e: unknown, log = true) {
     if (!isCancelled(e)) {
-      if (log) logLines = [...logLines, `[${name}] ERROR: ${e}`];
+      // The backend's failure text spans several lines — the exit code and the
+      // tail of rclone's own output. Pushing it as one entry made a paragraph
+      // pretending to be a log line.
+      if (log) addLog(name, `ERROR: ${e}`);
       // Always, even for a silent launch check: the badge on screen was earned
       // by a run that has now failed, so it has to be withdrawn. Suppressing
       // this with the log was how an expired token left a project reading
@@ -165,19 +193,19 @@
       setStatus(name, "unknown");
       return;
     }
-    if (log) logLines = [...logLines, `[${name}] Cancelled.`];
+    if (log) appendLog(`[${name}] Cancelled.`);
     if (mode === "push" || mode === "pull" || mode === "bisync") {
       setStatus(name, "modified", -1);
     }
     if (mode === "bisync" && log) {
-      logLines = [...logLines, `[${name}] NOTE: an interrupted bi-sync leaves rclone's listings stale — the next bi-sync will likely need --resync.`];
+      appendLog(`[${name}] NOTE: an interrupted bi-sync leaves rclone's listings stale — the next bi-sync will likely need --resync.`);
     }
   }
 
   async function handleCancel(project: Project) {
     if (!runningProjects.has(project.name) || cancellingProjects.has(project.name)) return;
     cancellingProjects = new Set([...cancellingProjects, project.name]);
-    logLines = [...logLines, `[${project.name}] Stopping ${runningProjects.get(project.name)}...`];
+    appendLog(`[${project.name}] Stopping ${runningProjects.get(project.name)}...`);
     await invoke("cancel_op", { projectName: project.name });
   }
 
@@ -190,7 +218,7 @@
     // token and is unaffected.
     if (activeBulk) activeBulk.cancelled = true;
     const names = [...runningProjects.keys()];
-    logLines = [...logLines, "--- CANCEL ALL ---"];
+    appendLog("--- CANCEL ALL ---");
     cancellingProjects = new Set([...cancellingProjects, ...names]);
     await Promise.all(names.map((n) => invoke("cancel_op", { projectName: n })));
   }
@@ -206,7 +234,7 @@
 
   async function handleAction(project: Project, mode: SyncMode) {
     if (runningProjects.has(project.name)) {
-      logLines = [...logLines, `[${project.name}] Skipped — ${runningProjects.get(project.name)} already in progress.`];
+      appendLog(`[${project.name}] Skipped — ${runningProjects.get(project.name)} already in progress.`);
       return;
     }
     if (mode === "pull") {
@@ -229,25 +257,29 @@
     }
 
     markRunning(project.name, mode);
-    logLines = [...logLines, `--- ${mode.toUpperCase()} ${project.name} ---`];
+    appendLog(`--- ${mode.toUpperCase()} ${project.name} ---`);
 
     try {
-      let result = "";
+      // Only a check contributes anything to the log at the end: its verdict is
+      // built by the backend from output the user never sees. Everything else
+      // returns rclone's own log, which already streamed here line by line while
+      // it ran — logging it again would print the whole run twice.
+      let summary = "";
       if (mode === "push") {
-        result = await invoke<string>("push", { projectName: project.name, dryRun: false });
+        await invoke<string>("push", { projectName: project.name, dryRun: false });
       } else if (mode === "dry-run") {
-        result = await invoke<string>("push", { projectName: project.name, dryRun: true });
+        await invoke<string>("push", { projectName: project.name, dryRun: true });
       } else if (mode === "pull") {
-        result = await invoke<string>("pull", { projectName: project.name, dryRun: false });
+        await invoke<string>("pull", { projectName: project.name, dryRun: false });
       } else if (mode === "bisync") {
-        result = await invoke<string>("bisync", { projectName: project.name });
+        await invoke<string>("bisync", { projectName: project.name });
       } else if (mode === "check") {
         const outcome = await invoke<CheckOutcome>("check", { projectName: project.name });
         applyCheckOutcome(project.name, outcome);
-        result = outcome.details;
+        summary = outcome.details;
       }
-      if (result) addLog(project.name, result);
-      logLines = [...logLines, `[${project.name}] Done.`];
+      if (summary) addLog(project.name, summary);
+      appendLog(`[${project.name}] Done.`);
       // After successful push/pull/bisync, mark as synced
       if (mode === "push" || mode === "pull" || mode === "bisync") {
         setStatus(project.name, "synced");
@@ -276,10 +308,10 @@
 
     try {
       await invoke("delete_local", { projectName: project.name });
-      logLines = [...logLines, `[${project.name}] Local copy deleted.`];
+      appendLog(`[${project.name}] Local copy deleted.`);
       projects = await invoke<ProjectStatus[]>("get_projects_status");
     } catch (e) {
-      logLines = [...logLines, `[${project.name}] DELETE ERROR: ${e}`];
+      addLog(project.name, `DELETE ERROR: ${e}`);
     }
   }
 
@@ -312,18 +344,19 @@
     push: {
       title: "Push all", concurrency: 3, verb: "pushed",
       run: (name) => invoke<string>("push", { projectName: name, dryRun: false }),
-      onSuccess: (name, result) => noteSuccess(name, result),
+      onSuccess: (name) => noteSuccess(name),
     },
     bisync: {
       title: "Bi-sync all", concurrency: 3, verb: "bi-synced",
       run: (name) => invoke<string>("bisync", { projectName: name }),
-      onSuccess: (name, result) => noteSuccess(name, result),
+      onSuccess: (name) => noteSuccess(name),
     },
   };
 
-  function noteSuccess(name: string, result: string) {
-    if (result) addLog(name, result);
-    logLines = [...logLines, `[${name}] Done.`];
+  /** The transfer's own output already streamed into the log as it happened, so
+   *  this only marks the end of it. */
+  function noteSuccess(name: string) {
+    appendLog(`[${name}] Done.`);
     setStatus(name, "synced");
   }
 
@@ -333,7 +366,7 @@
 
   async function runBulk(mode: BulkMode, silent = false) {
     if (activeBulk) {
-      if (!silent) logLines = [...logLines, `Skipped ${BULK[mode].title} — ${BULK[activeBulk.mode].title} is still running.`];
+      if (!silent) appendLog(`Skipped ${BULK[mode].title} — ${BULK[activeBulk.mode].title} is still running.`);
       return;
     }
     const run = { id: ++nextBulkId, mode, cancelled: false };
@@ -341,7 +374,7 @@
     bulkMode = mode;
 
     const spec = BULK[mode];
-    if (!silent) logLines = [...logLines, `--- ${spec.title.toUpperCase()} ---`];
+    if (!silent) appendLog(`--- ${spec.title.toUpperCase()} ---`);
 
     const queue = [...localProjects];
     let skipped = 0;
@@ -373,7 +406,7 @@
       if (queue.length > 0) notes.push(`${queue.length} not ${spec.verb}`);
       if (skipped > 0) notes.push(`${skipped} skipped (already running)`);
       const head = run.cancelled ? `${spec.title} cancelled` : `${spec.title} complete`;
-      logLines = [...logLines, notes.length ? `${head} — ${notes.join(", ")}.` : `${head}.`];
+      appendLog(notes.length ? `${head} — ${notes.join(", ")}.` : `${head}.`);
     }
   }
 
@@ -400,7 +433,7 @@
     if (ok) runBulk("bisync");
   }
 
-  function clearLog() { logLines = []; }
+  function clearLog() { logLines = []; droppedLines = 0; }
   function toggleShortcuts() { shortcutsEnabled = !shortcutsEnabled; }
   function toggleOutput() { showOutput = !showOutput; }
 
@@ -493,12 +526,16 @@
   $effect(() => {
     window.addEventListener("reload-projects", onReloadProjects);
 
-    // Retain the unlisten handle: without it every listener outlived its
+    // Retain the unlisten handles: without them every listener outlived its
     // component and the handlers stacked up. `disposed` covers teardown landing
     // before the async registration resolves.
-    let unlisten: (() => void) | undefined;
+    const unlisten: (() => void)[] = [];
     let disposed = false;
-    listen<{ projects: string[] }>("file-change", (event) => {
+    const track = (p: Promise<() => void>) => {
+      p.then((fn) => (disposed ? fn() : unlisten.push(fn)));
+    };
+
+    track(listen<{ projects: string[] }>("file-change", (event) => {
       const changed = event.payload.projects;
       const updated = { ...checkStatuses };
       for (const name of changed) {
@@ -507,15 +544,18 @@
         }
       }
       checkStatuses = updated;
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
+    }));
+
+    // rclone's output as it happens, in batches of whatever arrived together.
+    track(listen<{ project: string; lines: string[] }>("rclone-log", (event) => {
+      const { project, lines } = event.payload;
+      appendLog(...lines.map((l) => `[${project}] ${l}`));
+    }));
 
     return () => {
       disposed = true;
       window.removeEventListener("reload-projects", onReloadProjects);
-      unlisten?.();
+      for (const fn of unlisten) fn();
     };
   });
 </script>
@@ -644,7 +684,12 @@
   .log-meta { display: flex; gap: 8px; align-items: center; }
   .log-count { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
   .log-chevron { font-size: 10px; color: var(--text-muted); }
-  .log-body { flex: 1; overflow: auto; animation: slideDown 0.2s ease; }
+  /* `display: flex` and `min-height: 0` are load-bearing, not cosmetic. As a
+     plain block this box was a second scroller wrapping the log's own, and the
+     inner one then had no height constraint — so it grew to fit its content,
+     never overflowed, and every attempt to scroll it to the bottom did nothing.
+     That is why a finished run left the view sitting at line 1 of 17,000. */
+  .log-body { flex: 1; min-height: 0; display: flex; animation: slideDown 0.2s ease; }
   @keyframes slideDown { from { opacity: 0; max-height: 0; } to { opacity: 1; max-height: 280px; } }
   .loading { color: var(--text-muted); font-style: italic; }
   button.warn { border-color: var(--yellow); color: var(--yellow); }
