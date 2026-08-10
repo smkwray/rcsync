@@ -278,12 +278,14 @@
     }
     if (mode === "resync") {
       const ok = await customConfirm(
-        `Rebuild bi-sync listings for "${project.name}"?`,
+        `Resync and reconcile "${project.name}"?`,
         `Use this only when a bi-sync refused because this project's excludes changed.\n\n` +
-        `A resync discards the stored comparison state and rebuilds it from what is on disk now. ` +
-        `rclone resolves any difference in favour of LOCAL, so a file that differs on ${project.remote} ` +
-        `will be overwritten by the local copy. It cannot tell which version you wanted.`,
-        "Rebuild Listings",
+        `A resync does not just rebuild bookkeeping — it makes both sides a matching superset. ` +
+        `A file present on only one side is COPIED to the other, so anything you deleted on ` +
+        `just one side can reappear. Where the same path exists with different contents, LOCAL ` +
+        `wins and overwrites the copy on ${project.remote}.\n\n` +
+        `rclone cannot know which version, or which deletion, you intended.`,
+        "Run Resync",
         true,
         "resync",
       );
