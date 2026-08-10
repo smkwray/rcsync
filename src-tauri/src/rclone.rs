@@ -887,6 +887,35 @@ fn bisync_argv(
     Ok(args)
 }
 
+/// Widening the excludes makes every newly-hidden file look deleted to bisync.
+/// Nothing is destroyed — the deltas cancel — but once the hidden set passes
+/// rclone's 50% threshold the run safety-aborts, and it will abort identically
+/// on every attempt afterwards. Measured: `Safety abort: too many deletes
+/// (>50%, 3 of 4)`.
+///
+/// rclone's own advice in that message is `--force`, which is the wrong tool: it
+/// suppresses the safety check rather than rebuilding the listings the change
+/// invalidated. Say so, because a stuck bi-sync with rclone's suggestion in the
+/// log is how someone ends up forcing past a guard they needed.
+fn bisync_failure(code: i32, output: &str) -> String {
+    let mut message = failure_message(code, output);
+    if let Some(note) = bisync_abort_guidance(output) {
+        message.push('\n');
+        message.push_str(note);
+    }
+    message
+}
+
+fn bisync_abort_guidance(output: &str) -> Option<&'static str> {
+    let aborted = output.contains("too many deletes") || output.contains("Bisync aborted");
+    aborted.then_some(
+        "NOTE: if this project's excludes changed since its last bi-sync, this is expected — \
+         every newly-excluded file looks like a deletion to bisync. Nothing has been deleted. \
+         The fix is a one-time `rclone bisync <local> <remote> --resync` to rebuild its \
+         listings, NOT the `--force` rclone suggests above, which only suppresses the check.",
+    )
+}
+
 pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, String> {
     let local = check_local_path(project)?;
 
@@ -899,7 +928,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
     if code == 0 {
         Ok(output)
     } else {
-        Err(failure_message(code, &output))
+        Err(bisync_failure(code, &output))
     }
 }
 
@@ -1554,17 +1583,46 @@ mod tests {
         );
     }
 
-    /// Bi-sync survives a filter change without destroying anything for one
-    /// reason: a newly-excluded path vanishes from BOTH listings of the same
-    /// command at once, both sides register a deletion, and rclone's
-    /// `deletedonboth` branch queues nothing. That holds only while one filter
-    /// set governs both paths, and only while nothing tells rclone to act on
-    /// paths the filters hide.
+    /// Bi-sync survives a filter change without destroying anything, but NOT
+    /// because the filter protects the file. During bisync's apply phase the
+    /// queue is passed as `--files-from`, and `fs/filter` gives that precedence
+    /// over every exclude rule — so an `--exclude` is inert there, and bisync
+    /// has been observed both copying and deleting files that the active filter
+    /// matched. What actually protects is that a newly-hidden path leaves BOTH
+    /// listings of the same command at once, so both sides register a deletion
+    /// and rclone's `deletedonboth` branch queues nothing at all.
     ///
-    /// `--delete-excluded` is exactly that instruction, and it is one careless
-    /// line from here. Verified across 11 local bi-sync experiments — exclude
-    /// churn interleaved with real edits and deletes, partial re-narrowing,
-    /// repeated runs — as the only flag in this area that actually destroys.
+    /// That cancellation is the whole safety property, and it rests on one
+    /// filter set governing both paths. It breaks where the two sides record the
+    /// same file under different names — macOS NFD locally against NFC on Drive
+    /// or OneDrive, or a case-insensitive remote — because one pattern then
+    /// matches only one side's listing. See `do/state.md` for the evidence.
+    ///
+    /// `--delete-excluded` removes the property outright, and is one careless
+    /// line from here: with a non-empty copy queue it wipes the destination of
+    /// everything not in that queue, because `fs/sync` sets
+    /// `march.DstIncludeAll` while the source is `--files-from`-limited.
+    /// A stuck bi-sync must say why. Asserted against rclone's real abort text.
+    #[test]
+    fn a_safety_abort_explains_itself_and_contradicts_rclones_force_advice() {
+        let real = "ERROR : Safety abort: too many deletes (>50%, 3 of 4) on Path1 \"/x/\". \
+                    Run with --force if desired.\nNOTICE: Bisync aborted. Please try again.";
+        // Asserted through the function production calls, not the helper beside
+        // it: the first version of this test exercised only the helper, and the
+        // guidance sat unreferenced in the binary while the test passed.
+        let note = bisync_failure(1, real);
+        assert!(note.contains("--resync"), "the fix is a resync: {}", note);
+        assert!(note.contains("Nothing has been deleted"), "say plainly that nothing was lost");
+        assert!(
+            note.contains("NOT the `--force`"),
+            "rclone suggests --force two lines above; leaving that uncontradicted is the hazard"
+        );
+        assert!(
+            !bisync_failure(1, "ERROR : couldn't connect: token expired").contains("--resync"),
+            "an ordinary failure must not be dressed up as a filter-change abort"
+        );
+    }
+
     #[test]
     fn bisync_never_gets_a_flag_that_would_act_on_filtered_paths() {
         let cfg = test_cfg(vec!["node_modules/**"]);
