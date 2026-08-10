@@ -465,6 +465,10 @@ pub fn run() {
             pull_new_project,
         ])
         .setup(|app| {
+            // Give rclone somewhere to send its output while it is still
+            // running. Without this every operation is silent until it exits.
+            rclone::set_app_handle(app.handle().clone());
+
             // Start file watcher — keep the handle alive for the app's lifetime.
             // Wrapped in catch_unwind so a watcher failure never crashes the app.
             let handle = app.handle().clone();
