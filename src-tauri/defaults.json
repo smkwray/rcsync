@@ -10,7 +10,6 @@
     ".pytest_cache/**",
     ".mypy_cache/**",
     ".ruff_cache/**",
-    "quarantine*/**",
     ".DS_Store",
     "._*",
     "Thumbs.db",

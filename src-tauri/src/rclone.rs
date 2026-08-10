@@ -454,7 +454,11 @@ fn check_log_args() -> Vec<String> {
 /// It changes selection not at all, so the empty-source guard's filter parity is
 /// untouched. It is deliberately NOT passed to that guard anyway: the local
 /// backend implements no `ListR`, making it a no-op there and pure argv
-/// divergence. On OneDrive it is inert for the same reason.
+/// divergence. OneDrive reaches the same outcome by a different route — it does
+/// implement `ListR`, but `NewFs` sets `features.ListR = nil` unless the remote
+/// opts into `delta`, which is off by default. So the flag is inert there too
+/// under stock configuration, and simply becomes effective, not unsafe, for
+/// anyone who turns delta on.
 ///
 /// Costs accepted: the whole listing is held in memory, and rclone can degrade
 /// its 50-way grouping to 1 on a known Drive bug — which happened three times in
@@ -751,14 +755,19 @@ fn failure_message(code: i32, output: &str) -> String {
 /// sync but not by this local-path probe, and is outside the supported
 /// configuration (see README). There is also an unavoidable gap between probe
 /// and sync: a source emptied in between can still be synced as empty.
+fn probe_argv(cfg: &AppConfig, project: &Project, local: &str) -> Vec<String> {
+    let mut args = vec!["size".to_string(), local.to_string(), "--json".to_string()];
+    args.extend(build_exclude_args(cfg));
+    args.extend(project_exclude_args(project));
+    args
+}
+
 fn rclone_source_file_count(
     cfg: &AppConfig,
     project: &Project,
     local: &str,
 ) -> Result<i64, String> {
-    let mut args = vec!["size".to_string(), local.to_string(), "--json".to_string()];
-    args.extend(build_exclude_args(cfg));
-    args.extend(project_exclude_args(project));
+    let args = probe_argv(cfg, project, local);
 
     let (output, code) = run_rclone(cfg, &project.name, &args)?;
     if code != 0 {
@@ -789,6 +798,42 @@ fn ensure_source_not_empty(
     Ok(())
 }
 
+/// The exact argv a sync runs, built in one place so a test can assert on what
+/// production actually passes. Reconstructing it in a test instead let the real
+/// call sites be deleted with the suite still green.
+fn sync_argv(
+    cfg: &AppConfig,
+    project: &Project,
+    mode: &str,
+    local: &str,
+    remote: &str,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    let (src, dst) = match mode {
+        "pull" => (remote, local),
+        _ => (local, remote),
+    };
+
+    let mut args = vec!["sync".to_string(), src.to_string(), dst.to_string()];
+    args.extend(build_exclude_args(cfg));
+    args.extend(project_exclude_args(project));
+    args.extend(build_transfer_args(cfg)?);
+    args.extend(transfer_log_args());
+    // Push only. A pull runs `sync remote local`, so the remote is the SOURCE
+    // and the local copy is what `sync` deletes from — a recursive listing that
+    // omitted a remote file would make the local file look destination-only and
+    // delete the user's own work. The 5x measurement was taken on a push, and
+    // nothing about it transfers to an operation that can delete locally.
+    if mode == "push" {
+        args.extend(remote_listing_args());
+    }
+    args.push("-v".to_string());
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    Ok(args)
+}
+
 pub fn sync_project(
     cfg: &AppConfig,
     project: &Project,
@@ -806,21 +851,7 @@ pub fn sync_project(
         ensure_source_not_empty(cfg, project, &local, "push")?;
     }
 
-    let (src, dst) = match mode {
-        "pull" => (remote, local),
-        _ => (local, remote),
-    };
-
-    let mut args = vec!["sync".to_string(), src, dst];
-    args.extend(build_exclude_args(cfg));
-    args.extend(project_exclude_args(project));
-    args.extend(build_transfer_args(cfg)?);
-    args.extend(transfer_log_args());
-    args.extend(remote_listing_args());
-    args.push("-v".to_string());
-    if dry_run {
-        args.push("--dry-run".to_string());
-    }
+    let args = sync_argv(cfg, project, mode, &local, &remote, dry_run)?;
 
     let (output, code) = run_rclone(cfg, &project.name, &args)?;
     if code == 0 {
@@ -828,6 +859,32 @@ pub fn sync_project(
     } else {
         Err(failure_message(code, &output))
     }
+}
+
+/// The exact argv a bi-sync runs. Extracted for the same reason as `sync_argv`:
+/// this is the one operation that can delete on both sides, so what it is
+/// actually handed must be assertable.
+fn bisync_argv(
+    cfg: &AppConfig,
+    project: &Project,
+    local: &str,
+    remote: &str,
+) -> Result<Vec<String>, String> {
+    // No `--fast-list` here, and NOT because bisync supplies one itself. rclone's
+    // docs still say "bisync uses --fast-list by default"; that stopped being
+    // true in v1.66, when bisync's listing moved to `march`, which honours
+    // `ci.UseListR` like every other command. Passing it would change real
+    // behaviour. It is withheld because the 5x measurement was taken on a
+    // one-way push, and bisync is the single operation that can delete on both
+    // sides — the last place to extend a listing-strategy flag on borrowed
+    // evidence.
+    let mut args = vec!["bisync".to_string(), local.to_string(), remote.to_string()];
+    args.extend(build_exclude_args(cfg));
+    args.extend(project_exclude_args(project));
+    args.extend(build_transfer_args(cfg)?);
+    args.extend(transfer_log_args());
+    args.push("-v".to_string());
+    Ok(args)
 }
 
 pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, String> {
@@ -836,14 +893,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
     ensure_source_not_empty(cfg, project, &local, "bi-sync")?;
 
     let remote = cfg.remote_path_for_project(project);
-
-    let mut args = vec!["bisync".to_string(), local, remote];
-    args.extend(build_exclude_args(cfg));
-    args.extend(project_exclude_args(project));
-    args.extend(build_transfer_args(cfg)?);
-    args.extend(transfer_log_args());
-    args.extend(remote_listing_args());
-    args.push("-v".to_string());
+    let args = bisync_argv(cfg, project, &local, &remote)?;
 
     let (output, code) = run_rclone(cfg, &project.name, &args)?;
     if code == 0 {
@@ -853,21 +903,32 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
     }
 }
 
-pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome, String> {
-    let local = check_local_path(project)?;
-    let remote = cfg.remote_path_for_project(project);
-
+fn check_argv(cfg: &AppConfig, project: &Project, local: &str, remote: &str) -> Vec<String> {
     let mut args = vec![
         "check".to_string(),
-        local,
-        remote,
+        local.to_string(),
+        remote.to_string(),
         "--combined".to_string(),
         "-".to_string(),
     ];
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
     args.extend(check_log_args());
+    // Kept here, unlike pull and bisync, on two grounds. The measurement was a
+    // `sync --dry-run`, which performs exactly this listing-and-compare and
+    // nothing else, so the evidence covers this workload directly. And a check
+    // writes nothing: were a recursive listing ever to omit a remote file, the
+    // file reads as local-only, which is a *difference* — this operation's
+    // failure direction is a spurious "not synced", never a false "in sync".
     args.extend(remote_listing_args());
+    args
+}
+
+pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome, String> {
+    let local = check_local_path(project)?;
+    let remote = cfg.remote_path_for_project(project);
+
+    let args = check_argv(cfg, project, &local, &remote);
 
     let (raw_output, code) = run_rclone(cfg, &project.name, &args)?;
     parse_check_output(&raw_output, code)
@@ -1458,28 +1519,154 @@ mod tests {
         );
     }
 
-    /// `--fast-list` earned its place by measurement (659 s -> 131 s on a real
-    /// Drive remote), and it is safe only because it changes no file selection.
-    /// The empty-source guard's whole correctness rests on the probe and the
-    /// sync agreeing about scope, so this pins that the flag reaches the
-    /// commands that talk to a remote and never the probe that decides whether
-    /// a push is allowed to run at all.
+    /// `--fast-list` was measured on a push (659 s -> 131 s against a real Drive
+    /// remote) and is confined to where that evidence reaches. Asserting on the
+    /// argv the production builders return, not on a reconstruction: the
+    /// previous version of this test checked `remote_listing_args()` in
+    /// isolation and would have stayed green if every real call site were
+    /// deleted.
     #[test]
-    fn fast_list_reaches_remote_operations_but_never_the_source_probe() {
-        assert_eq!(remote_listing_args(), vec!["--fast-list".to_string()]);
-
+    fn fast_list_goes_to_push_and_check_only_never_to_pull_bisync_or_the_probe() {
         let cfg = test_cfg(vec!["node_modules/**"]);
         let project = project_with(vec![]);
+        let has_flag = |args: &[String]| args.iter().any(|a| a == "--fast-list");
 
-        // What the probe builds, mirrored from `rclone_source_file_count`.
-        let mut probe = vec!["size".to_string(), "/tmp/x".to_string(), "--json".to_string()];
-        probe.extend(build_exclude_args(&cfg));
-        probe.extend(project_exclude_args(&project));
+        let push = sync_argv(&cfg, &project, "push", "/tmp/local", "gdrive:proj/x", false).unwrap();
+        assert!(has_flag(&push), "the measured 5x win is on push and must reach it");
+
+        let dry = sync_argv(&cfg, &project, "dry-run", "/tmp/local", "gdrive:proj/x", true).unwrap();
         assert!(
-            !probe.iter().any(|a| a == "--fast-list"),
+            !has_flag(&dry),
+            "only the literal push mode opts in; anything else must not inherit it by accident"
+        );
+
+        // A pull runs `sync remote local`: the remote is the source, so a
+        // recursive listing that omitted a remote file would make the user's
+        // local file look destination-only and delete it.
+        let pull = sync_argv(&cfg, &project, "pull", "/tmp/local", "gdrive:proj/x", false).unwrap();
+        assert!(!has_flag(&pull), "a listing-strategy flag must never reach an operation that deletes locally");
+
+        assert!(has_flag(&check_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x")));
+        assert!(
+            !has_flag(&probe_argv(&cfg, &project, "/tmp/local")),
             "the local backend has no ListR, so this would be a no-op that only \
              lets the guard's argv drift from the sync's"
         );
+    }
+
+    /// Bi-sync survives a filter change without destroying anything for one
+    /// reason: a newly-excluded path vanishes from BOTH listings of the same
+    /// command at once, both sides register a deletion, and rclone's
+    /// `deletedonboth` branch queues nothing. That holds only while one filter
+    /// set governs both paths, and only while nothing tells rclone to act on
+    /// paths the filters hide.
+    ///
+    /// `--delete-excluded` is exactly that instruction, and it is one careless
+    /// line from here. Verified across 11 local bi-sync experiments — exclude
+    /// churn interleaved with real edits and deletes, partial re-narrowing,
+    /// repeated runs — as the only flag in this area that actually destroys.
+    #[test]
+    fn bisync_never_gets_a_flag_that_would_act_on_filtered_paths() {
+        let cfg = test_cfg(vec!["node_modules/**"]);
+        let project = project_with(vec!["artifacts/**"]);
+        let args = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x").unwrap();
+
+        for forbidden in ["--delete-excluded", "--force", "--ignore-errors", "--resync"] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "{} turns a filter change from a no-op into data loss",
+                forbidden
+            );
+        }
+        // One filter set, governing both paths of the one command.
+        assert_eq!(
+            args.iter().filter(|a| *a == "--exclude").count(),
+            2,
+            "both paths of a bi-sync must be filtered by the same single set: {:?}",
+            args
+        );
+    }
+
+    /// The guard's correctness is that the probe and the push are filtered
+    /// identically. Compared as production builds them, so removing a filter
+    /// from either call site fails here.
+    #[test]
+    fn the_probe_and_the_push_are_filtered_identically() {
+        let cfg = test_cfg(vec!["node_modules/**", ".git/**"]);
+        let project = project_with(vec!["artifacts/**"]);
+
+        let filters = |args: &[String]| -> Vec<String> {
+            args.windows(2)
+                .filter(|w| w[0] == "--exclude")
+                .map(|w| w[1].clone())
+                .collect()
+        };
+
+        let probe = probe_argv(&cfg, &project, "/tmp/local");
+        let push = sync_argv(&cfg, &project, "push", "/tmp/local", "gdrive:proj/x", false).unwrap();
+
+        assert_eq!(
+            filters(&probe),
+            vec!["node_modules/**", ".git/**", "artifacts/**"],
+            "the probe must carry the global and per-project filters, in order"
+        );
+        assert_eq!(
+            filters(&probe),
+            filters(&push),
+            "the guard decides whether a push may run at all; if it and the push \
+             disagree about scope, an 'empty' source can delete a remote"
+        );
+    }
+
+    /// The shipped defaults are merged into every user's filter set and there is
+    /// no mechanism to remove one (`config::load_config` only appends extras).
+    /// A default that over-matches therefore silently stops backing up a
+    /// stranger's files, and a `check` afterwards still reads as in sync,
+    /// because it applies the same filters. Adjudicated by the real rclone
+    /// binary, since rclone's matcher is the only authority on its own globs.
+    #[test]
+    fn the_shipped_defaults_do_not_over_match() {
+        let defaults: Vec<String> = serde_json::from_str::<serde_json::Value>(
+            include_str!("../defaults.json"),
+        )
+        .unwrap()["excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        let dir = temp_dir("default-filter-corpus");
+        // Must be excluded: the gap that motivated widening the venv pattern.
+        fs::create_dir_all(dir.join(".venv314/lib")).unwrap();
+        fs::write(dir.join(".venv314/lib/site.py"), "x").unwrap();
+        // Must NOT be excluded. `quarantine*/**` was briefly a shipped default;
+        // it matched any directory merely starting with "quarantine" at any
+        // depth, which is one installation's convention imposed on everyone.
+        fs::create_dir_all(dir.join("quarantined-data")).unwrap();
+        fs::write(dir.join("quarantined-data/records.csv"), "x").unwrap();
+        // Must NOT be excluded: a file, not a virtualenv directory.
+        fs::write(dir.join(".venv-notes.md"), "x").unwrap();
+
+        let cfg = test_cfg(defaults.iter().map(String::as_str).collect());
+        let kept = rclone_source_file_count(&cfg, &project_with(vec![]), dir.to_str().unwrap());
+        let listed = Command::new("rclone")
+            .args(["lsf", "-R", dir.to_str().unwrap(), "--files-only"])
+            .args(build_exclude_args(&cfg))
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(kept.unwrap(), 2, "kept the wrong set:\n{}", listed);
+        assert!(!listed.contains(".venv314"), "a virtualenv must be excluded:\n{}", listed);
+        assert!(
+            listed.contains("quarantined-data/records.csv"),
+            "a stranger's directory that merely starts with 'quarantine' must survive \
+             the shipped defaults — they cannot remove one:\n{}",
+            listed
+        );
+        assert!(listed.contains(".venv-notes.md"), "a file is not a virtualenv:\n{}", listed);
     }
 
     // --- structured log: a heartbeat is a snapshot, not an event ---
