@@ -279,8 +279,10 @@
     if (mode === "bisync") {
       const ok = await customConfirm(
         `Bi-Sync "${project.name}"?`,
-        `Two-way sync between local and ${project.remote}.\nChanges on both sides will be merged. Conflicts may arise.`,
+        `Two-way sync between local and ${project.remote}.\nChanges on both sides will be merged. Conflicts may arise.\nThis is the only operation that can delete on BOTH sides.`,
         "Bi-Sync",
+        true,
+        "bisync",
       );
       if (!ok) return;
     }
@@ -458,8 +460,10 @@
     const count = localProjects.length;
     const ok = await customConfirm(
       `Bi-Sync All (${count} projects)?`,
-      `Two-way sync all ${count} local projects with their remotes.\nChanges on both sides will be merged. Conflicts may arise.`,
+      `Two-way sync all ${count} local projects with their remotes.\nChanges on both sides will be merged. Conflicts may arise.\nThis is the only operation that can delete on BOTH sides, across every project.`,
       "Bi-Sync All",
+      true,
+      "bisync",
     );
     if (ok) runBulk("bisync");
   }

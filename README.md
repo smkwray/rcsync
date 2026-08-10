@@ -32,7 +32,9 @@
 
 ### Design philosophy
 
-**Local is always authoritative.** Push is the default. Pull and Bi-Sync require explicit confirmation with Cancel focused by default. Delete only removes the local copy — the remote is never touched.
+**Local is always authoritative.** Push is the default and runs unconfirmed. Pull, Bi-Sync and Delete each require you to type a confirmation word — `pull`, `bisync`, `delete` — with Cancel focused by default. Delete only removes the local copy; the remote is never touched.
+
+Defaults are merged into your filter set and cannot be removed from configuration, so they are kept deliberately narrow: caches, virtualenvs, build output, VCS metadata and OS junk. Anything specific to how *you* organise a project belongs in `extra_excludes`, not here.
 
 ## Prerequisites
 
@@ -123,9 +125,10 @@ Contains exclude patterns and default scan directories. Safe to check into versi
 ```json
 {
   "excludes": [
-    "node_modules/**", ".git/**", ".venv/**",
-    "__pycache__/**", "src-tauri/target/**",
-    ".DS_Store", "._*"
+    "node_modules/**", ".git/**", ".worktrees/**",
+    ".venv*/**", ".tmp-validate-venv/**", "src-tauri/target/**",
+    "__pycache__/**", ".pytest_cache/**", ".mypy_cache/**", ".ruff_cache/**",
+    ".DS_Store", "._*", "Thumbs.db", "desktop.ini"
   ],
   "scan_dirs": ["~/projects"],
   "default_pull_dir": "~/projects"
