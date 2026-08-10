@@ -11,6 +11,16 @@
   let logLines: string[] = $state([]);
   let runningProjects: Map<string, string> = $state(new Map()); // name -> mode
   let cancellingProjects: Set<string> = $state(new Set());
+  /** Latest progress snapshot per project. Deliberately not part of `logLines`:
+   *  rclone re-reports the same counters on a timer, so appending them filled
+   *  the panel with page after page of identical text whenever a transfer sat
+   *  still. One row that updates in place says the same thing. */
+  let progress: Map<string, string> = $state(new Map());
+  /** Projects whose rclone output must not reach the log. A silent launch check
+   *  suppresses its own result lines; without this the live stream would put
+   *  them back, which is the whole thing "silent" exists to avoid. Progress is
+   *  still shown — that is a status, not log noise. */
+  const silentProjects = new Set<string>();
   let loaded = $state(false);
   let search = $state("");
   let selectedIndex = $state(-1);
@@ -64,6 +74,9 @@
 
   let localProjects = $derived(projects.filter((p) => p.exists_locally));
   let anyRunning = $derived(runningProjects.size > 0 || bulkMode !== null);
+  // Gated on `runningProjects` as well as its own map, so a snapshot that
+  // arrived just as an operation ended cannot leave a stale row on screen.
+  let activeProgress = $derived([...progress].filter(([name]) => runningProjects.has(name)));
 
   // Sort: pinned first, then alphabetical
   let sortedProjects = $derived(() => {
@@ -163,6 +176,11 @@
     const m = new Map(runningProjects);
     m.delete(name);
     runningProjects = m;
+    if (progress.has(name)) {
+      const p = new Map(progress);
+      p.delete(name);
+      progress = p;
+    }
     if (cancellingProjects.has(name)) {
       const c = new Set(cancellingProjects);
       c.delete(name);
@@ -385,11 +403,13 @@
       // projects over.
       if (runningProjects.has(ps.name)) { skipped++; return; }
       markRunning(ps.name, mode);
+      if (silent) silentProjects.add(ps.name);
       try {
         spec.onSuccess(ps.name, await spec.run(ps.name), silent);
       } catch (e) {
         noteFailure(ps.name, mode, e, !silent);
       }
+      silentProjects.delete(ps.name);
       markDone(ps.name);
     }
 
@@ -549,7 +569,13 @@
     // rclone's output as it happens, in batches of whatever arrived together.
     track(listen<{ project: string; lines: string[] }>("rclone-log", (event) => {
       const { project, lines } = event.payload;
+      if (silentProjects.has(project)) return;
       appendLog(...lines.map((l) => `[${project}] ${l}`));
+    }));
+
+    track(listen<{ project: string; text: string }>("rclone-progress", (event) => {
+      const { project, text } = event.payload;
+      progress = new Map([...progress, [project, text]]);
     }));
 
     return () => {
@@ -629,6 +655,19 @@
       {/if}
     </div>
 
+    <!-- Outside the collapsible log on purpose: knowing a transfer is moving is
+         exactly what you want when you have hidden the log. -->
+    {#if activeProgress.length > 0}
+      <div class="progress-strip">
+        {#each activeProgress as [name, text] (name)}
+          <div class="progress-row">
+            <span class="progress-name">{name}</span>
+            <span class="progress-text">{text}</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
     <div class="log-section" class:collapsed={!showOutput}>
       <div class="log-header" onclick={toggleOutput} role="button" tabindex="-1">
         <span class="log-title">Output</span>
@@ -677,6 +716,10 @@
   .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; overflow-y: auto; flex: 1; }
   .card-wrapper { border-radius: var(--radius); transition: box-shadow 0.15s; }
   .card-wrapper.selected { box-shadow: 0 0 0 2px #22d3ee, 0 0 12px rgba(34, 211, 238, 0.25); border-radius: var(--radius); }
+  .progress-strip { display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; }
+  .progress-row { display: flex; gap: 10px; align-items: baseline; font-family: var(--font-mono); font-size: 12px; padding: 4px 10px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); }
+  .progress-name { color: var(--accent); font-weight: 600; flex-shrink: 0; }
+  .progress-text { color: var(--text); font-variant-numeric: tabular-nums; }
   .log-section { display: flex; flex-direction: column; min-height: 32px; max-height: 280px; transition: max-height 0.25s ease, min-height 0.25s ease; }
   .log-section.collapsed { max-height: 32px; min-height: 32px; }
   .log-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; cursor: pointer; user-select: none; }
