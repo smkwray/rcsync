@@ -14,6 +14,7 @@
     ondelete,
     onpin,
     onupdated,
+    needsResync = false,
   }: {
     project: Project;
     running: boolean;
@@ -26,6 +27,8 @@
     ondelete: (project: Project) => void;
     onpin: (project: Project) => void;
     onupdated?: () => void;
+    /** Set after a bi-sync on this project stopped before applying anything. */
+    needsResync?: boolean;
   } = $props();
 
   /** The action row, in display order. While an operation runs, the button that
@@ -37,12 +40,20 @@
     { mode: "dry-run", label: "Dry Run", cls: "" },
     { mode: "check", label: "Check", cls: "" },
     { mode: "bisync", label: "Bi-Sync", cls: "warn" },
-    // Recovery for a bi-sync that rclone refused because this project's filter
-    // set changed. Destructive in its own right — it resolves toward local — so
-    // it carries its own typed confirmation rather than sharing Bi-Sync's.
-    { mode: "resync", label: "Resync", cls: "danger" },
     { mode: "pull", label: "Pull", cls: "danger" },
   ];
+
+  /** Recovery for a bi-sync that rclone refused because this project's filter
+   *  set changed. Shown only once that has actually happened: it is rare, it is
+   *  destructive in its own right (it resolves toward local), and as a
+   *  permanent sixth button it wrapped the row and buried Pull on a line of its
+   *  own. Appearing at the moment it becomes the answer is also more use than
+   *  sitting there being ignored. */
+  let actions = $derived(
+    needsResync
+      ? [...ACTIONS, { mode: "resync" as SyncMode, label: "Resync", cls: "danger" }]
+      : ACTIONS,
+  );
 
   function openFolder() {
     invoke("open_folder", { localPath: project.local_path });
@@ -223,7 +234,7 @@
   </div>
 
   <div class="actions">
-    {#each ACTIONS as { mode, label, cls } (mode)}
+    {#each actions as { mode, label, cls } (mode)}
       {#if running && runningMode === mode}
         <button class="cancel-op" disabled={cancelling} title="Stop this {label.toLowerCase()}"
           onclick={() => oncancel(project)}>
