@@ -21,6 +21,13 @@
    *  them back, which is the whole thing "silent" exists to avoid. Progress is
    *  still shown — that is a status, not log noise. */
   const silentProjects = new Set<string>();
+  /** Projects whose last bi-sync stopped before applying anything — normally a
+   *  filter change, which rclone refuses until the listings are rebuilt. The
+   *  Resync button appears only for these, since it is a rare recovery and a
+   *  destructive one. Matched on the phrase the backend's guidance carries; a
+   *  Rust test pins that wording. */
+  let resyncNeeded: Set<string> = $state(new Set());
+  const PRE_APPLY_STOP_MARKER = "stopped BEFORE applying";
   let loaded = $state(false);
   let search = $state("");
   let selectedIndex = $state(-1);
@@ -215,6 +222,9 @@
       // tail of rclone's own output. Pushing it as one entry made a paragraph
       // pretending to be a log line.
       if (log) addLog(name, `ERROR: ${e}`);
+      if (mode === "bisync" && String(e).includes(PRE_APPLY_STOP_MARKER)) {
+        resyncNeeded = new Set([...resyncNeeded, name]);
+      }
       // Always, even for a silent launch check: the badge on screen was earned
       // by a run that has now failed, so it has to be withdrawn. Suppressing
       // this with the log was how an expired token left a project reading
@@ -681,6 +691,7 @@
               ondelete={handleDelete}
               onpin={togglePin}
               onupdated={loadProjects}
+              needsResync={resyncNeeded.has(project.name)}
             />
           </div>
         {/each}
