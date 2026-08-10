@@ -2,6 +2,7 @@
   "excludes": [
     "node_modules/**",
     ".git/**",
+    ".worktrees/**",
     ".venv/**",
     ".venv312/**",
     ".tmp-validate-venv/**",
