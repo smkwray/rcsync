@@ -76,10 +76,12 @@
   async function saveIgnores() {
     savingIgnores = true;
     ignoreError = "";
+    // Blank rows are dropped, but a pattern is NOT trimmed here: outer
+    // whitespace changes what rclone matches in a filters file versus on a
+    // command line, so the backend refuses it rather than quietly repairing it.
     const patterns = ignoreText
       .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
+      .filter((l) => l.trim().length > 0);
     try {
       await invoke("set_project_excludes", { projectName: project.name, excludes: patterns });
       showIgnores = false;

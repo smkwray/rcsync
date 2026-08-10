@@ -116,14 +116,18 @@ fn get_project_excludes(project_name: String) -> Vec<String> {
 /// `push` would resolve, so nothing else about the project changes.
 #[tauri::command]
 fn set_project_excludes(project_name: String, excludes: Vec<String>) -> Result<(), String> {
-    // Normalize: trim, drop blank lines, dedupe while preserving order.
+    // Validated, not normalised. Trimming here would silently repair a pattern
+    // that means different things to a filters file and to a command-line
+    // argument, and would make the rule unreachable from every production path.
     let mut seen = std::collections::HashSet::new();
-    let cleaned: Vec<String> = excludes
-        .into_iter()
-        .map(|e| e.trim().to_string())
-        .filter(|e| !e.is_empty())
-        .filter(|e| seen.insert(e.clone()))
-        .collect();
+    let mut cleaned: Vec<String> = Vec::new();
+    for pattern in excludes {
+        if let Some(valid) = config::validate_exclude_pattern(&pattern)? {
+            if seen.insert(valid.to_string()) {
+                cleaned.push(valid.to_string());
+            }
+        }
+    }
 
     let mut cfg = load_config();
     if let Some(p) = cfg.projects.iter_mut().find(|p| p.name == project_name) {
@@ -496,4 +500,49 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    /// `set_project_excludes` is the command the ignore editor calls, and it is
+    /// where a silently-repaired pattern would enter the config. Reinstating a
+    /// `.trim()` there once left the whole suite green, because the only
+    /// coverage went through `save_config` instead.
+    #[test]
+    fn the_ignore_editor_command_refuses_a_pattern_it_would_otherwise_repair() {
+        let path = std::env::temp_dir().join(format!("rcsync-cmd-{}.json", std::process::id()));
+        std::env::set_var("RCSYNC_CONFIG", &path);
+
+        let outcomes: Vec<Result<(), String>> = [" leading/**", "trailing/** ", "break/**\n"]
+            .iter()
+            .map(|bad| set_project_excludes("p".into(), vec![bad.to_string()]))
+            .collect();
+        // A blank row is not a filter and must still be accepted and dropped.
+        let blank = set_project_excludes("p".into(), vec!["   ".into()]);
+
+        let _ = std::fs::remove_file(&path);
+        std::env::remove_var("RCSYNC_CONFIG");
+
+        // Asserted on the REASON, not merely on Err. This command also fails
+        // when the project is unknown, so `is_err()` alone cannot tell a
+        // validation rejection from an unrelated one — and a first version of
+        // this test passed even with the trim reinstated because of exactly that.
+        for (bad, outcome) in [" leading/**", "trailing/** ", "break/**\n"].iter().zip(&outcomes) {
+            let err = outcome.as_ref().expect_err(&format!("{:?} must be rejected", bad));
+            assert!(
+                err.contains("whitespace") || err.contains("line break"),
+                "{:?} was not rejected as a bad pattern — it was trimmed on the way in and failed \
+                 for some other reason: {}",
+                bad,
+                err
+            );
+        }
+        // Not asserting Ok: the project does not exist, so this fails for an
+        // unrelated reason. What must not happen is a *validation* rejection.
+        if let Err(e) = blank {
+            assert!(!e.contains("whitespace"), "a blank row is not a filter: {}", e);
+        }
+    }
 }
