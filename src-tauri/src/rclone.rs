@@ -5,6 +5,8 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 /// Error text returned when the user stops an operation. Exact string, matched
 /// by the frontend so a cancel reads as a cancel and not as a sync failure.
@@ -94,6 +96,69 @@ pub fn request_cancel(name: &str) -> bool {
     true
 }
 
+/// Where live rclone output is sent. Set once at startup; unset under `cargo
+/// test`, where mirroring is simply skipped rather than faked.
+static APP: OnceLock<AppHandle> = OnceLock::new();
+
+pub fn set_app_handle(handle: AppHandle) {
+    let _ = APP.set(handle);
+}
+
+#[derive(Clone, serde::Serialize)]
+struct LogEvent {
+    project: String,
+    lines: Vec<String>,
+}
+
+/// How long a line may wait for company before being sent on its own.
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Mirrors rclone's log to the UI while it is still running, instead of after it
+/// exits. A 90-minute sync used to show nothing at all until the process ended
+/// and then dumped seventeen thousand lines at once.
+///
+/// Batched, because the flood is real: a sync of a source tree logs a line per
+/// file, and one IPC message per line would spend more time serialising progress
+/// than transferring. A line arriving after a quiet moment still goes out
+/// immediately — only bursts coalesce — so the log stays live at low rates and
+/// stays cheap at high ones.
+struct LiveLog {
+    project: String,
+    pending: Vec<String>,
+    last_flush: Instant,
+}
+
+impl LiveLog {
+    fn new(project: &str) -> Self {
+        Self {
+            project: project.to_string(),
+            pending: Vec::new(),
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        self.pending.push(line.to_string());
+        if self.last_flush.elapsed() >= LOG_FLUSH_INTERVAL {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(&mut self.pending);
+        if let Some(app) = APP.get() {
+            let _ = app.emit(
+                "rclone-log",
+                LogEvent { project: self.project.clone(), lines },
+            );
+        }
+        self.last_flush = Instant::now();
+    }
+}
+
 fn rclone_command(program: &str) -> Command {
     let cmd = Command::new(program);
     #[cfg(windows)]
@@ -156,6 +221,34 @@ fn build_transfer_args(cfg: &AppConfig) -> Result<Vec<String>, String> {
         None => Vec::new(),
         Some(n) => vec!["--transfers".to_string(), n.to_string()],
     })
+}
+
+/// A progress heartbeat for a transfer. Formatting only — unlike `--transfers`,
+/// these change what rclone *prints*, never what it selects or moves, so there
+/// is no user setting for them to override.
+///
+/// One line every 10 s instead of rclone's default eleven-line block every
+/// minute. The interval alone would have made things worse: at 10 s the default
+/// block would bury the per-file lines it is meant to sit beside.
+fn transfer_stats_args() -> Vec<String> {
+    vec!["--stats".into(), "10s".into(), "--stats-one-line".into()]
+}
+
+/// A progress heartbeat for a check, which transfers nothing — so the one-line
+/// form is useless here (it reports bytes moved, always zero) and the full block
+/// is what carries `Checks: n / m`, the only real measure of how far along a
+/// check is.
+///
+/// `--stats-log-level NOTICE` rather than `-v`: stats print at INFO, and turning
+/// the whole run up to INFO would add a log line per difference on top of the
+/// itemized verdict the app already builds from `--combined`.
+fn check_stats_args() -> Vec<String> {
+    vec![
+        "--stats".into(),
+        "15s".into(),
+        "--stats-log-level".into(),
+        "NOTICE".into(),
+    ]
 }
 
 /// Pull the file count out of `rclone size --json` output.
@@ -242,19 +335,54 @@ fn resolve_rclone(cfg: &AppConfig) -> String {
     p.clone()
 }
 
-/// Read a child pipe to the end. Lossy because rclone echoes filenames, which
-/// are not guaranteed to be UTF-8.
+/// Read a child pipe to the end, handing every complete line to `live` as it
+/// arrives and returning the whole stream as well.
+///
+/// Splits on bytes and converts each line lossily, rather than using
+/// `BufRead::lines`: rclone echoes filenames, which are not guaranteed to be
+/// UTF-8, and one undecodable name must not fail the entire read.
 ///
 /// Errors propagate rather than yielding a short read: output that silently went
 /// missing is indistinguishable from a clean run with nothing to report, and
 /// callers turn "no output" into verdicts.
-fn drain<R: Read>(pipe: Option<R>, which: &str) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        pipe.read_to_end(&mut bytes)
+fn drain<R: Read>(
+    pipe: Option<R>,
+    which: &str,
+    mut on_line: Option<&mut dyn FnMut(&str)>,
+) -> Result<String, String> {
+    let mut all = String::new();
+    let Some(mut pipe) = pipe else { return Ok(all) };
+
+    let mut emit = |text: &str, all: &mut String| {
+        if let Some(f) = on_line.as_mut() {
+            f(text);
+        }
+        all.push_str(text);
+        all.push('\n');
+    };
+
+    let mut buf = [0u8; 8192];
+    let mut partial: Vec<u8> = Vec::new();
+    loop {
+        let n = pipe
+            .read(&mut buf)
             .map_err(|e| format!("Failed to read rclone {}: {}", which, e))?;
+        if n == 0 {
+            break;
+        }
+        partial.extend_from_slice(&buf[..n]);
+        while let Some(nl) = partial.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = partial.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line[..nl]);
+            emit(text.trim_end_matches('\r'), &mut all);
+        }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    // Whatever rclone wrote without a closing newline is still output.
+    if !partial.is_empty() {
+        let text = String::from_utf8_lossy(&partial).into_owned();
+        emit(&text, &mut all);
+    }
+    Ok(all)
 }
 
 /// Run rclone and return combined stdout+stderr as a string. `key` is the
@@ -273,13 +401,28 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
     // Drain both pipes on their own threads. `-v` produces more than a pipe
     // buffer holds, and rclone blocks forever on a full pipe — so reading them
     // one after the other, or only after waiting, would hang the sync.
+    //
+    // Only stderr is mirrored to the UI, and that split is rclone's own: it
+    // writes its log there — progress, notices, errors — while stdout carries
+    // *data* the app parses rather than shows, namely `size --json` and the
+    // per-file markers of `check --combined`. Streaming stdout too would bury a
+    // check's verdict under one line per matching file.
     let out_reader = std::thread::spawn({
         let stdout = child.take_stdout();
-        move || drain(stdout, "stdout")
+        move || drain(stdout, "stdout", None)
     });
     let err_reader = std::thread::spawn({
         let stderr = child.take_stderr();
-        move || drain(stderr, "stderr")
+        let key = key.to_string();
+        move || {
+            let mut live = LiveLog::new(&key);
+            let mut sink = |line: &str| live.push(line);
+            let result = drain(stderr, "stderr", Some(&mut sink));
+            drop(sink);
+            // Whatever the last batch was waiting for company, send it now.
+            live.flush();
+            result
+        }
     });
 
     // Publish the child and re-read the cancel flag under one lock. Either a
@@ -324,8 +467,61 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
             result.push('\n');
         }
     }
-    let code = status.code().unwrap_or(-1);
+    // No exit code at all means rclone did not exit — something killed it. The
+    // app's own Cancel is already handled above, so reaching here means the
+    // signal came from outside: a `kill`, a crash, a machine going to sleep.
+    // Reporting the bare `-1` that stands in for "no code" reads as an rclone
+    // failure and sends the next hour of debugging in the wrong direction.
+    let code = match status.code() {
+        Some(c) => c,
+        None => {
+            result.push_str(&format!("rclone did not exit on its own — {}\n", signal_note(&status)));
+            -1
+        }
+    };
     Ok((result, code))
+}
+
+#[cfg(unix)]
+fn signal_note(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal() {
+        Some(sig) => format!("it was terminated by signal {}", sig),
+        None => "it was terminated by the operating system".to_string(),
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_note(_status: &std::process::ExitStatus) -> String {
+    "it was terminated by the operating system".to_string()
+}
+
+/// Lines kept from a failed run's output when reporting it as an error.
+const FAILURE_TAIL_LINES: usize = 20;
+
+/// Explain a non-zero exit without repeating the whole run.
+///
+/// The output already reached the log line by line while rclone was running, so
+/// restating seventeen thousand lines inside the error message is duplication —
+/// but dropping the context entirely would leave "exit 1" and nothing to act on.
+/// rclone puts what matters last: `Failed to sync with N errors: last error was
+/// ...` is the final line it prints.
+fn failure_message(code: i32, output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let head = format!("Exited with code {}", code);
+    if lines.len() <= FAILURE_TAIL_LINES {
+        return if lines.is_empty() {
+            head
+        } else {
+            format!("{}\n{}", head, lines.join("\n"))
+        };
+    }
+    format!(
+        "{}\n... {} earlier lines are above in the log ...\n{}",
+        head,
+        lines.len() - FAILURE_TAIL_LINES,
+        lines[lines.len() - FAILURE_TAIL_LINES..].join("\n")
+    )
 }
 
 /// How many files rclone itself would sync out of `local`, asked with exactly the
@@ -410,6 +606,7 @@ pub fn sync_project(
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
     args.extend(build_transfer_args(cfg)?);
+    args.extend(transfer_stats_args());
     args.push("-v".to_string());
     if dry_run {
         args.push("--dry-run".to_string());
@@ -419,7 +616,7 @@ pub fn sync_project(
     if code == 0 {
         Ok(output)
     } else {
-        Err(format!("{}\nExited with code {}", output, code))
+        Err(failure_message(code, &output))
     }
 }
 
@@ -434,13 +631,14 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
     args.extend(build_transfer_args(cfg)?);
+    args.extend(transfer_stats_args());
     args.push("-v".to_string());
 
     let (output, code) = run_rclone(cfg, &project.name, &args)?;
     if code == 0 {
         Ok(output)
     } else {
-        Err(format!("{}\nExited with code {}", output, code))
+        Err(failure_message(code, &output))
     }
 }
 
@@ -457,6 +655,7 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome,
     ];
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
+    args.extend(check_stats_args());
 
     let (raw_output, code) = run_rclone(cfg, &project.name, &args)?;
     parse_check_output(&raw_output, code)
@@ -494,9 +693,14 @@ fn parse_check_output(raw: &str, code: i32) -> Result<CheckOutcome, String> {
             // it, so neither do we.
             "! " => { unreadable += 1; "UNREADABLE" }
             _ => {
+                // A periodic stats block opens with a bare `NOTICE:` and puts
+                // its numbers on the following lines, so the message itself is
+                // empty — a blank line in the verdict, not a notice.
                 if let Some(msg) = line.split("NOTICE: ").nth(1) {
-                    details.push_str(msg);
-                    details.push('\n');
+                    if !msg.trim().is_empty() {
+                        details.push_str(msg);
+                        details.push('\n');
+                    }
                 }
                 continue;
             }
@@ -814,6 +1018,102 @@ mod tests {
         assert_eq!(without_exclude.unwrap(), 1, "without it the source has real content");
     }
 
+    // --- live output: rclone's log has to reach the user while it is running ---
+
+    /// The defect this pins: output was read with `read_to_end`, so a 90-minute
+    /// push showed nothing at all and then dumped seventeen thousand lines the
+    /// instant it finished. Reverting to a read-to-end makes the first line
+    /// arrive only once the child has exited, which this measures directly.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_reaches_the_log_before_the_process_that_wrote_it_exits() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "echo first; sleep 2; echo second"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take();
+
+        let start = Instant::now();
+        let mut first_seen: Option<Duration> = None;
+        {
+            let mut sink = |_line: &str| {
+                if first_seen.is_none() {
+                    first_seen = Some(start.elapsed());
+                }
+            };
+            drain(stdout, "stdout", Some(&mut sink)).unwrap();
+        }
+        let _ = child.wait();
+
+        let first = first_seen.expect("the first line must be delivered at all");
+        assert!(
+            first < Duration::from_secs(1),
+            "the first line surfaced after {:?}, i.e. only once the process ended — \
+             output is being buffered to the end again",
+            first
+        );
+        assert!(
+            start.elapsed() >= Duration::from_secs(2),
+            "sanity: the child really did keep running long after writing that line"
+        );
+    }
+
+    #[test]
+    fn every_line_is_handed_over_including_an_unterminated_and_an_undecodable_one() {
+        // rclone echoes filenames, which are not guaranteed to be UTF-8. Reading
+        // lines through a UTF-8 decoder would fail the whole stream on one bad
+        // name, and a run's last line often has no closing newline.
+        let raw: Vec<u8> = b"first\r\nsecond \xff\xfe name\nno trailing newline".to_vec();
+        let mut seen: Vec<String> = Vec::new();
+        let all = {
+            let mut sink = |line: &str| seen.push(line.to_string());
+            drain(Some(&raw[..]), "stdout", Some(&mut sink)).unwrap()
+        };
+
+        assert_eq!(seen.len(), 3, "got {:?}", seen);
+        assert_eq!(seen[0], "first", "a CRLF line must not carry \\r into the log");
+        assert!(
+            seen[1].starts_with("second ") && seen[1].ends_with(" name"),
+            "one undecodable byte must not cost the rest of the line: {:?}",
+            seen[1]
+        );
+        assert_eq!(seen[2], "no trailing newline");
+        assert_eq!(all.lines().collect::<Vec<_>>(), seen, "the returned output and the streamed lines must be the same text");
+    }
+
+    // --- failure reporting: enough context, not a second copy of the run ---
+
+    #[test]
+    fn a_short_failure_is_reported_in_full() {
+        let msg = failure_message(1, "ERROR: quota exceeded\nFailed to sync");
+        assert!(msg.starts_with("Exited with code 1"));
+        assert!(msg.contains("quota exceeded") && msg.contains("Failed to sync"));
+    }
+
+    #[test]
+    fn a_long_failure_keeps_the_end_and_says_what_it_dropped() {
+        // rclone puts the reason last: "Failed to sync with N errors: last error
+        // was ...". Keeping the head instead would keep the least useful part,
+        // and keeping all of it would repeat a run the log already has.
+        let output: String = (1..=500).map(|i| format!("line {}\n", i)).collect();
+        let msg = failure_message(1, &output);
+
+        assert!(msg.contains("line 500"), "the last line is the reason and must survive");
+        assert!(!msg.contains("line 1\n"), "the head must not be kept");
+        assert!(
+            msg.contains("480 earlier lines"),
+            "a truncated report must say how much it dropped, not truncate silently: {}",
+            msg
+        );
+        assert!(msg.lines().count() <= FAILURE_TAIL_LINES + 2);
+    }
+
+    #[test]
+    fn a_failure_with_no_output_still_names_the_code() {
+        assert_eq!(failure_message(7, ""), "Exited with code 7");
+    }
+
     // --- parsing: every unreadable answer must fail closed, never read as 0 ---
 
     // --- transfer tuning: bounded, opt-in, and nowhere near the safety probe ---
@@ -868,8 +1168,8 @@ mod tests {
         probe.extend(project_exclude_args(&project));
 
         assert!(
-            !probe.iter().any(|a| a == "--transfers"),
-            "performance flags must never reach the empty-source probe"
+            !probe.iter().any(|a| a == "--transfers" || a.starts_with("--stats")),
+            "performance and progress flags must never reach the empty-source probe"
         );
         assert_eq!(
             probe.iter().filter(|a| *a == "--exclude").count(),
@@ -933,6 +1233,23 @@ mod tests {
                 raw
             );
         }
+    }
+
+    #[test]
+    fn a_stats_block_does_not_become_a_notice_in_the_verdict() {
+        // The periodic progress block opens with a bare `NOTICE:` and puts its
+        // numbers on the lines below, so treating the message as a notice adds
+        // a blank line to the verdict for every heartbeat of a long check.
+        let raw = "= a.txt\n2026/08/10 11:06:45 NOTICE: \nChecks: 1 / 1, 100%\n\
+                   2026/08/10 11:06:45 NOTICE: real message\n";
+        let out = parse_check_output(raw, 0).unwrap();
+        assert!(out.synced);
+        assert!(out.details.contains("real message"), "a genuine notice must still be kept");
+        assert!(
+            !out.details.contains("\n\n"),
+            "the empty stats notice leaked into the verdict: {:?}",
+            out.details
+        );
     }
 
     #[test]
