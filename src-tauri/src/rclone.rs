@@ -238,6 +238,14 @@ struct LiveLog {
     project: String,
     pending: Vec<String>,
     last_flush: Instant,
+    /// Everything handed off, retained under `cargo test` only. The real
+    /// destination is a Tauri handle that does not exist in a test binary, so
+    /// without this the whole emit path is unobservable and a test cannot tell
+    /// a working router from one whose body has been deleted.
+    #[cfg(test)]
+    sent_log: Vec<String>,
+    #[cfg(test)]
+    sent_progress: Vec<String>,
 }
 
 impl LiveLog {
@@ -246,6 +254,10 @@ impl LiveLog {
             project: project.to_string(),
             pending: Vec::new(),
             last_flush: Instant::now(),
+            #[cfg(test)]
+            sent_log: Vec::new(),
+            #[cfg(test)]
+            sent_progress: Vec::new(),
         }
     }
 
@@ -261,6 +273,8 @@ impl LiveLog {
             return;
         }
         let lines = std::mem::take(&mut self.pending);
+        #[cfg(test)]
+        self.sent_log.extend(lines.iter().cloned());
         if let Some(app) = APP.get() {
             let _ = app.emit(
                 "rclone-log",
@@ -274,12 +288,54 @@ impl LiveLog {
     /// in one place that updates rather than appending. Not batched: rclone
     /// already emits these on a timer, and only the newest one matters.
     fn progress(&mut self, text: &str) {
+        #[cfg(test)]
+        self.sent_progress.push(text.to_string());
         if let Some(app) = APP.get() {
             let _ = app.emit(
                 "rclone-progress",
                 ProgressEvent { project: self.project.clone(), text: text.to_string() },
             );
         }
+    }
+}
+
+/// Splits rclone's stderr into the two things that come out of it: a log of
+/// events, and the latest progress snapshot.
+///
+/// A named type rather than a closure inside `run_rclone` because this join is
+/// the whole feature, and as a closure it was untestable — `render_log_line` and
+/// `drain` were each covered in isolation while the three lines connecting them
+/// could be deleted with the suite still green. Production and tests now drive
+/// the same `line`.
+struct StderrRouter {
+    live: LiveLog,
+    text: String,
+}
+
+impl StderrRouter {
+    fn new(project: &str) -> Self {
+        Self { live: LiveLog::new(project), text: String::new() }
+    }
+
+    fn line(&mut self, raw: &str) {
+        match render_log_line(raw) {
+            // Deliberately not added to `text`: heartbeats are a view of the run,
+            // not a record of it, and callers turn that text into error messages
+            // and verdicts.
+            LogLine::Progress(snapshot) => self.live.progress(&snapshot),
+            LogLine::Event(line) => {
+                self.live.push(&line);
+                self.text.push_str(&line);
+                self.text.push('\n');
+            }
+        }
+    }
+
+    /// Send whatever the last batch was waiting for company, and hand back the
+    /// accumulated event text.
+    fn finish(mut self) -> String {
+        self.live.flush();
+        self.text
     }
 }
 
@@ -568,25 +624,12 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
         let stderr = child.take_stderr();
         let key = key.to_string();
         move || -> Result<String, String> {
-            let mut text = String::new();
-            let mut live = LiveLog::new(&key);
-            let read = {
-                let mut sink = |raw: &str| match render_log_line(raw) {
-                    LogLine::Progress(snapshot) => live.progress(&snapshot),
-                    LogLine::Event(line) => {
-                        live.push(&line);
-                        text.push_str(&line);
-                        text.push('\n');
-                    }
-                };
-                drain(stderr, "stderr", &mut sink)
-            };
-            // Whatever the last batch was waiting for company, send it now.
-            live.flush();
+            let mut router = StderrRouter::new(&key);
+            let read = drain(stderr, "stderr", &mut |raw| router.line(raw));
+            // Finish either way: a read that failed partway still produced lines
+            // the user should see.
+            let text = router.finish();
             read?;
-            // Heartbeats are deliberately absent from the returned output: they
-            // are a view of the run, not a record of it, and callers turn this
-            // text into error messages and verdicts.
             Ok(text)
         }
     });
@@ -1453,6 +1496,58 @@ mod tests {
             LogLine::Progress(text) => text,
             LogLine::Event(e) => panic!("a heartbeat became a log line: {:?}", e),
         }
+    }
+
+    /// The join between `render_log_line` and the output the caller gets. Both
+    /// halves were covered in isolation while the code connecting them was not,
+    /// so the whole live-output feature could be deleted with the suite green:
+    /// blanking the log hand-off, or letting heartbeats fall through into the
+    /// log and the returned text, both left 41 tests passing.
+    #[test]
+    fn the_router_sends_events_to_the_log_and_keeps_heartbeats_out_of_the_record() {
+        let mut router = StderrRouter::new("test-router");
+        let stream = [
+            r#"{"level":"info","msg":"Copied (new)","object":"src/main.ts"}"#,
+            &stats_record("\"bytes\":330079,\"totalBytes\":330079,\"transfers\":12,\"totalTransfers\":12"),
+            r#"{"level":"error","msg":"permission denied","object":"data/locked.md"}"#,
+            &stats_record("\"checks\":900,\"totalChecks\":48471"),
+        ];
+        for line in stream {
+            router.line(line);
+        }
+
+        // Batching means the log hand-off is still pending on a fast machine;
+        // force it so this asserts on what was sent, not on timing.
+        router.live.flush();
+        let sent_log = router.live.sent_log.clone();
+        let sent_progress = router.live.sent_progress.clone();
+        let text = router.finish();
+
+        // Both heartbeats reached the progress channel and nothing else did.
+        assert_eq!(sent_progress.len(), 2, "every heartbeat must reach the progress row: {:?}", sent_progress);
+        assert!(sent_progress.iter().all(|p| p.contains("files") || p.contains("checked")));
+
+        // Both events reached the log, and neither heartbeat did.
+        assert_eq!(
+            sent_log.len(),
+            2,
+            "exactly the two events belong in the log, got {:?}",
+            sent_log
+        );
+        assert!(sent_log.iter().any(|l| l == "src/main.ts: Copied (new)"));
+        assert!(sent_log.iter().any(|l| l.starts_with("ERROR data/locked.md: ")));
+        assert!(
+            !sent_log.iter().any(|l| l.contains("KiB") || l.contains("checked")),
+            "a heartbeat reached the log — that is the flood this exists to stop: {:?}",
+            sent_log
+        );
+
+        // And the text handed back to callers, which becomes error messages and
+        // check verdicts, carries the events only.
+        assert_eq!(
+            text, "src/main.ts: Copied (new)\nERROR data/locked.md: permission denied\n",
+            "the returned record must be the events, with no heartbeat text in it"
+        );
     }
 
     #[test]

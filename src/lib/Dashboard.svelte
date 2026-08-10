@@ -169,6 +169,17 @@
   }
 
   function markRunning(name: string, mode: string) {
+    // Drop any snapshot left over from a previous operation on this project
+    // before it becomes visible again. Browse's pull emits progress under the
+    // project name without ever going through markDone, so its final snapshot
+    // could survive and then render as the status of the *next* run for the
+    // couple of seconds before a fresh one arrives — or for the whole run, if
+    // that run finished first.
+    if (progress.has(name)) {
+      const p = new Map(progress);
+      p.delete(name);
+      progress = p;
+    }
     runningProjects = new Map([...runningProjects, [name, mode]]);
   }
 
