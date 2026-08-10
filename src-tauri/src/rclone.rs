@@ -116,6 +116,17 @@ struct ProgressEvent {
     text: String,
 }
 
+/// rclone's own pre-apply safety stops, matched against the structured `msg`
+/// field alone. Matching the rendered line instead would also see the `object`
+/// field, so a record naming a *file* that happened to contain one of these
+/// phrases would be read as a safety stop — and the assurance attached to one
+/// ("nothing was applied") is exactly the statement that must never be wrong.
+const PRE_APPLY_STOPS: [&str; 3] = [
+    "Safety abort: too many deletes",
+    "Safety abort: all files were changed",
+    "Bisync critical error: filters file has changed",
+];
+
 /// One line of rclone's structured log, sorted by what it is worth doing with.
 enum LogLine {
     /// A stats heartbeat. The same counters re-reported on a timer, so it is a
@@ -132,16 +143,19 @@ enum LogLine {
 /// that is how the empty-source probe, which is given no `--use-json-log`, keeps
 /// working, and it means a future rclone that changes the schema degrades to raw
 /// text instead of losing the line.
-fn render_log_line(raw: &str) -> LogLine {
+fn render_log_line(raw: &str) -> (LogLine, bool) {
     let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
     let Some(record) = parsed.as_ref().filter(|v| v.get("msg").is_some()) else {
-        return LogLine::Event(raw.to_string());
+        return (LogLine::Event(raw.to_string()), false);
     };
     if let Some(stats) = record.get("stats") {
-        return LogLine::Progress(format_progress(stats));
+        return (LogLine::Progress(format_progress(stats)), false);
     }
 
     let msg = record.get("msg").and_then(|m| m.as_str()).unwrap_or("").trim();
+    // Classified here, where the structured message is still separate from the
+    // object it concerns.
+    let pre_apply_stop = PRE_APPLY_STOPS.iter().any(|m| msg.contains(m));
     let mut out = String::new();
     // Only levels that change how the line should be read get a marker. Tagging
     // "info" too would put a word in front of every one of thousands of lines.
@@ -158,7 +172,7 @@ fn render_log_line(raw: &str) -> LogLine {
         }
     }
     out.push_str(msg);
-    LogLine::Event(out)
+    (LogLine::Event(out), pre_apply_stop)
 }
 
 /// A stats snapshot as one compact line, built from rclone's numbers rather
@@ -310,15 +324,20 @@ impl LiveLog {
 struct StderrRouter {
     live: LiveLog,
     text: String,
+    /// Set when rclone reported one of its pre-apply safety stops. Derived from
+    /// the structured record, not from `text`.
+    pre_apply_stop: bool,
 }
 
 impl StderrRouter {
     fn new(project: &str) -> Self {
-        Self { live: LiveLog::new(project), text: String::new() }
+        Self { live: LiveLog::new(project), text: String::new(), pre_apply_stop: false }
     }
 
     fn line(&mut self, raw: &str) {
-        match render_log_line(raw) {
+        let (rendered, pre_apply_stop) = render_log_line(raw);
+        self.pre_apply_stop |= pre_apply_stop;
+        match rendered {
             // Deliberately not added to `text`: heartbeats are a view of the run,
             // not a record of it, and callers turn that text into error messages
             // and verdicts.
@@ -333,9 +352,9 @@ impl StderrRouter {
 
     /// Send whatever the last batch was waiting for company, and hand back the
     /// accumulated event text.
-    fn finish(mut self) -> String {
+    fn finish(mut self) -> (String, bool) {
         self.live.flush();
-        self.text
+        (self.text, self.pre_apply_stop)
     }
 }
 
@@ -383,25 +402,9 @@ pub struct RemoteDir {
 fn effective_excludes(cfg: &AppConfig, project: &Project) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for pattern in cfg.excludes.iter().chain(project.excludes.iter()) {
-        // A blank entry is not a filter; it is an empty row in a settings box.
-        if pattern.trim().is_empty() {
-            continue;
+        if let Some(valid) = config::validate_exclude_pattern(pattern)? {
+            out.push(valid.to_string());
         }
-        if pattern.contains('\n') || pattern.contains('\r') {
-            return Err(format!(
-                "Exclude pattern contains a line break, which would forge extra filter rules: {:?}",
-                pattern
-            ));
-        }
-        if pattern != pattern.trim() {
-            return Err(format!(
-                "Exclude pattern has leading or trailing whitespace, which rclone strips from a \
-                 filters file but not from a command-line argument — the two would select \
-                 different files. Remove the spaces: {:?}",
-                pattern
-            ));
-        }
-        out.push(pattern.clone());
     }
     Ok(out)
 }
@@ -621,7 +624,18 @@ fn drain<R: Read>(
 /// Run rclone and return combined stdout+stderr as a string. `key` is the
 /// project name the operation is registered under, which is how a cancel
 /// request finds this process.
-fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i32), String> {
+/// What a completed rclone run produced. `pre_apply_stop` is set only from a
+/// structured `msg`, so a caller cannot accidentally re-derive it by searching
+/// the human text — which is how an object-specific record could be mistaken
+/// for a safety stop.
+#[derive(Debug)]
+struct RcloneRun {
+    output: String,
+    code: i32,
+    pre_apply_stop: bool,
+}
+
+fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<RcloneRun, String> {
     let rclone = resolve_rclone(cfg);
     let mut cmd = rclone_command(&rclone);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -654,14 +668,14 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
     let err_reader = std::thread::spawn({
         let stderr = child.take_stderr();
         let key = key.to_string();
-        move || -> Result<String, String> {
+        move || -> Result<(String, bool), String> {
             let mut router = StderrRouter::new(&key);
             let read = drain(stderr, "stderr", &mut |raw| router.line(raw));
             // Finish either way: a read that failed partway still produced lines
             // the user should see.
-            let text = router.finish();
+            let finished = router.finish();
             read?;
-            Ok(text)
+            Ok(finished)
         }
     });
 
@@ -698,7 +712,7 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
     // A panicked reader or a failed read used to become an empty string, which
     // downstream reads as "rclone said nothing" — i.e. a clean result.
     let stdout = stdout??;
-    let stderr = stderr??;
+    let (stderr, pre_apply_stop) = stderr??;
     let status = status.map_err(|e| format!("Failed to wait for rclone: {}", e))?;
     let mut result = String::new();
     for line in stdout.lines().chain(stderr.lines()) {
@@ -719,7 +733,7 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
             -1
         }
     };
-    Ok((result, code))
+    Ok(RcloneRun { output: result, code, pre_apply_stop })
 }
 
 #[cfg(unix)]
@@ -795,14 +809,14 @@ fn rclone_source_file_count(
 ) -> Result<i64, String> {
     let args = probe_argv(cfg, project, local)?;
 
-    let (output, code) = run_rclone(cfg, &project.name, &args)?;
-    if code != 0 {
+    let run = run_rclone(cfg, &project.name, &args)?;
+    if run.code != 0 {
         return Err(format!(
             "Could not check whether '{}' has anything to sync (rclone size exited {}):\n{}",
-            local, code, output
+            local, run.code, run.output
         ));
     }
-    parse_rclone_size_count(&output)
+    parse_rclone_size_count(&run.output)
 }
 
 /// Refuse an operation whose source rclone considers empty. `sync` and `bisync`
@@ -878,11 +892,11 @@ pub fn sync_project(
 
     let args = sync_argv(cfg, project, mode, &local, &remote, dry_run)?;
 
-    let (output, code) = run_rclone(cfg, &project.name, &args)?;
-    if code == 0 {
-        Ok(output)
+    let run = run_rclone(cfg, &project.name, &args)?;
+    if run.code == 0 {
+        Ok(run.output)
     } else {
-        Err(failure_message(code, &output))
+        Err(failure_message(run.code, &run.output))
     }
 }
 
@@ -933,14 +947,14 @@ fn filters_file_path(project: &Project) -> Result<std::path::PathBuf, String> {
     Ok(dir.join(format!("{}-{:016x}.filter", prefix, name_digest(&project.name))))
 }
 
-/// FNV-1a over the project name. Not cryptographic — it only has to separate
+/// FNV-1a (64-bit) over the project name. Not cryptographic — it only has to separate
 /// names that the readable prefix collapses together, and it must not pull in a
 /// dependency to do it.
 fn name_digest(name: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in name.as_bytes() {
         hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
 }
@@ -1019,43 +1033,23 @@ fn bisync_argv(
 /// suppresses the safety check rather than rebuilding the listings the change
 /// invalidated. Say so, because a stuck bi-sync with rclone's suggestion in the
 /// log is how someone ends up forcing past a guard they needed.
-fn bisync_failure(code: i32, output: &str) -> String {
+fn bisync_failure(code: i32, output: &str, pre_apply_stop: bool) -> String {
     let mut message = failure_message(code, output);
-    if let Some(note) = bisync_abort_guidance(output) {
+    if pre_apply_stop {
         message.push('\n');
-        message.push_str(note);
+        message.push_str(
+            "NOTE: this run stopped BEFORE applying any queued change, so nothing was copied or \
+             deleted in it. If this project's excludes changed since its last bi-sync, that is the \
+             likely cause — every newly-hidden file looks like a deletion to bisync. Recover with \
+             this app's Resync button on the project card, which reruns with the same paths and the \
+             same filters. Do NOT use the `--force` rclone suggests above (it suppresses the check \
+             instead of rebuilding the listings), and do not run a bare `rclone bisync --resync` \
+             by hand (it would rebuild them under a different filter set than this app uses).",
+        );
     }
     message
 }
 
-fn bisync_abort_guidance(output: &str) -> Option<&'static str> {
-    // Matched on the *pre-apply* safety stops only. `Bisync aborted` on its own
-    // is far broader: rclone emits it for critical errors too, and a critical
-    // error can be raised after `applyDeltas` has begun and after queued copies
-    // or deletes have already run. Nothing about a bisync is transactional, so
-    // attaching a reassurance to that generic text would state "nothing was
-    // deleted" at exactly the moment it is most likely to be untrue.
-    // Anchored on rclone's complete messages, not on loose tokens. A bare
-    // `--max-delete` would match a filename or an unrelated later error and
-    // attach a pre-apply safety claim to a run that had already copied or
-    // deleted. Nothing about a bi-sync is transactional, so that claim is only
-    // ever safe for the stops rclone makes *before* it applies anything.
-    const PRE_APPLY_STOPS: [&str; 3] = [
-        "Safety abort: too many deletes",
-        "Safety abort: all files were changed",
-        "Bisync critical error: filters file has changed",
-    ];
-    let pre_apply_stop = PRE_APPLY_STOPS.iter().any(|m| output.contains(m));
-    pre_apply_stop.then_some(
-        "NOTE: this run stopped BEFORE applying any queued change, so nothing was copied or \
-         deleted in it. If this project's excludes changed since its last bi-sync, that is the \
-         likely cause — every newly-hidden file looks like a deletion to bisync. Recover with \
-         this app's Resync button on the project card, which reruns with the same paths and the \
-         same filters. Do NOT use the `--force` rclone suggests above (it suppresses the check \
-         instead of rebuilding the listings), and do not run a bare `rclone bisync --resync` \
-         by hand (it would rebuild them under a different filter set than this app uses).",
-    )
-}
 
 /// `resync` rebuilds bisync's stored listings from scratch and is the only way
 /// past rclone's filters-file refusal. It is a separate entry point on purpose:
@@ -1070,11 +1064,11 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project, resync: bool) -> Resul
     let remote = cfg.remote_path_for_project(project);
     let args = bisync_argv(cfg, project, &local, &remote, resync)?;
 
-    let (output, code) = run_rclone(cfg, &project.name, &args)?;
-    if code == 0 {
-        Ok(output)
+    let run = run_rclone(cfg, &project.name, &args)?;
+    if run.code == 0 {
+        Ok(run.output)
     } else {
-        Err(bisync_failure(code, &output))
+        Err(bisync_failure(run.code, &run.output, run.pre_apply_stop))
     }
 }
 
@@ -1109,8 +1103,8 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome,
 
     let args = check_argv(cfg, project, &local, &remote)?;
 
-    let (raw_output, code) = run_rclone(cfg, &project.name, &args)?;
-    parse_check_output(&raw_output, code)
+    let run = run_rclone(cfg, &project.name, &args)?;
+    parse_check_output(&run.output, run.code)
 }
 
 /// Turn `rclone check --combined` output into a verdict, or refuse to give one.
@@ -1764,51 +1758,50 @@ mod tests {
     /// line from here: with a non-empty copy queue it wipes the destination of
     /// everything not in that queue, because `fs/sync` sets
     /// `march.DstIncludeAll` while the source is `--files-from`-limited.
-    /// A stuck bi-sync must say why. Asserted against rclone's real abort text.
+    /// A stuck bi-sync must say why — and the classification must come from
+    /// rclone's structured `msg`, never from the rendered line. The rendered
+    /// line also carries the `object` field, so a record naming a FILE that
+    /// contains one of rclone's safety phrases would otherwise be read as a
+    /// safety stop and receive the one assurance that must never be wrong.
     #[test]
-    fn a_safety_abort_explains_itself_and_contradicts_rclones_force_advice() {
-        let real = "ERROR : Safety abort: too many deletes (>50%, 3 of 4) on Path1 \"/x/\". \
-                    Run with --force if desired.\nNOTICE: Bisync aborted. Please try again.";
-        // Asserted through the function production calls, not the helper beside
-        // it: the first version of this test exercised only the helper, and the
-        // guidance sat unreferenced in the binary while the test passed.
-        let note = bisync_failure(1, real);
-        assert!(note.contains("--resync"), "the fix is a resync: {}", note);
+    fn a_pre_apply_stop_is_classified_from_the_structured_message_only() {
+        let stop_in_msg = r#"{"level":"error","msg":"Safety abort: too many deletes (>50%, 3 of 4)"}"#;
+        let (_, is_stop) = render_log_line(stop_in_msg);
+        assert!(is_stop, "rclone's own safety message must be recognised");
+
+        for msg in [
+            "Safety abort: all files were changed",
+            "Bisync critical error: filters file has changed",
+        ] {
+            let raw = format!(r#"{{"level":"error","msg":"{}"}}"#, msg);
+            assert!(render_log_line(&raw).1, "{} must be recognised", msg);
+        }
+
+        // The phrase in the OBJECT, with an unrelated failure in the message.
+        let phrase_in_object = r#"{"level":"error","msg":"Failed to copy: permission denied","object":"notes/Safety abort: too many deletes.txt"}"#;
+        let (rendered, is_stop) = render_log_line(phrase_in_object);
         assert!(
-            note.contains("stopped BEFORE applying"),
-            "the claim must be scoped to a pre-apply stop, not a blanket 'nothing was deleted' \
-             that a post-apply critical error would falsify: {}",
-            note
+            !is_stop,
+            "a filename containing the phrase must not be read as a safety stop"
         );
+        if let LogLine::Event(text) = rendered {
+            assert!(
+                text.contains("Safety abort: too many deletes"),
+                "sanity: the phrase really is present in the rendered line, which is why \
+                 classifying from rendered text was unsafe: {}",
+                text
+            );
+        }
+
+        // And the message the user gets, driven by the typed flag.
+        let stopped = bisync_failure(1, "whatever rclone printed", true);
+        assert!(stopped.contains("stopped BEFORE applying"));
+        assert!(stopped.contains("Resync button"), "recovery must point at the app's own action");
+        assert!(stopped.contains("Do NOT use the `--force`"), "rclone suggests --force; contradict it");
         assert!(
-            note.contains("Do NOT use the `--force`"),
-            "rclone suggests --force two lines above; leaving that uncontradicted is the hazard"
-        );
-        assert!(
-            note.contains("Resync button"),
-            "recovery must point at the app's own action, which reruns with the same filters"
-        );
-        // A loose `--max-delete` token would match a filename or an unrelated
-        // later error and attach a pre-apply safety claim to a run that had
-        // already copied or deleted.
-        assert!(
-            !bisync_failure(1, "ERROR : file --max-delete-notes.txt: failed to copy")
+            !bisync_failure(1, "ERROR : Bisync aborted. Must run --resync to recover.", false)
                 .contains("stopped BEFORE applying"),
-            "the matcher must be anchored on rclone's complete safety messages"
-        );
-        assert!(
-            bisync_failure(1, "Bisync critical error: filters file has changed (must run --resync)")
-                .contains("resync"),
-            "the refusal this app's own filters file now causes must be explained"
-        );
-        assert!(
-            !bisync_failure(1, "ERROR: Bisync aborted. Must run --resync to recover.")
-                .contains("stopped BEFORE applying"),
-            "a generic abort can follow completed operations; it must get no safety claim"
-        );
-        assert!(
-            !bisync_failure(1, "ERROR : couldn't connect: token expired").contains("--resync"),
-            "an ordinary failure must not be dressed up as a filter-change abort"
+            "a generic abort can follow completed operations and gets no safety claim"
         );
     }
 
@@ -1862,6 +1855,30 @@ mod tests {
         assert_eq!(a, b, "the guard's filters and bi-sync's filters must select the same files");
     }
 
+    #[test]
+    fn an_ordinary_bisync_carries_the_filters_file_and_never_resyncs() {
+        let cfg = test_cfg(vec!["node_modules/**"]);
+        let project = project_with(vec!["artifacts/**"]);
+        let args = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", false).unwrap();
+
+        assert!(
+            args.iter().any(|a| a == "--filters-file"),
+            "without this, rclone's fail-closed hash check never runs: {:?}",
+            args
+        );
+        assert!(
+            !args.iter().any(|a| a == "--exclude"),
+            "inline excludes alongside a filters file would reintroduce the unprotected form"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--resync"),
+            "an ordinary bi-sync must never rebuild the listings a filter change invalidated"
+        );
+
+        let resync = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", true).unwrap();
+        assert!(resync.iter().any(|a| a == "--resync"), "the migration path must opt in explicitly");
+    }
+
     /// The property the whole filters-file change exists for, proved against the
     /// real rclone binary rather than argued from its source: once a bi-sync
     /// history exists, changing the effective filter set makes the next ordinary
@@ -1910,9 +1927,17 @@ mod tests {
             text
         );
         assert!(survived && junk_intact, "the refusal must come before anything is touched");
+        // Production passes --use-json-log, so this refusal reaches the app as a
+        // structured record. Feeding rclone's own wording through the classifier
+        // ties the phrase it really emits to the phrase we match — a rename
+        // upstream breaks this test rather than silently disabling the guidance.
+        let line = text.lines().find(|l| l.contains("filters file has changed")).unwrap();
+        let msg = line.split("ERROR : ").last().unwrap_or(line).trim();
+        let record = serde_json::json!({ "level": "error", "msg": msg }).to_string();
         assert!(
-            bisync_abort_guidance(&text).is_some(),
-            "the user must be told what this refusal means and how to recover"
+            render_log_line(&record).1,
+            "the refusal rclone actually emits must classify as a pre-apply stop: {:?}",
+            msg
         );
     }
 
@@ -1951,6 +1976,19 @@ mod tests {
         );
     }
 
+    /// A known-answer vector for the digest. It is persistent on-disk identity:
+    /// the filters file and rclone's `.md5` sidecar are keyed on the path it
+    /// produces, so changing the algorithm later renames every project's history
+    /// and forces a resync. The absence of this test is why a wrong multiplier
+    /// (a digit too long, so not FNV-1a at all) survived review.
+    #[test]
+    fn the_name_digest_is_really_fnv_1a() {
+        // Canonical FNV-1a 64-bit vectors.
+        assert_eq!(name_digest(""), 0xcbf2_9ce4_8422_2325, "offset basis");
+        assert_eq!(name_digest("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(name_digest("foobar"), 0x8594_4171_f739_67e8);
+    }
+
     /// Two projects must never share a filters file, because rclone stores its
     /// hash beside it as `<file>.md5` and treats that path as the identity of
     /// the protected history. Sharing means they lock each other out — and with
@@ -1977,31 +2015,6 @@ mod tests {
         let escaped = filters_file_path(&named("../../etc/passwd")).unwrap();
         assert!(escaped.to_string_lossy().contains("bisync-filters"));
         assert!(!escaped.to_string_lossy().contains(".."));
-    }
-
-
-    #[test]
-    fn an_ordinary_bisync_carries_the_filters_file_and_never_resyncs() {
-        let cfg = test_cfg(vec!["node_modules/**"]);
-        let project = project_with(vec!["artifacts/**"]);
-        let args = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", false).unwrap();
-
-        assert!(
-            args.iter().any(|a| a == "--filters-file"),
-            "without this, rclone's fail-closed hash check never runs: {:?}",
-            args
-        );
-        assert!(
-            !args.iter().any(|a| a == "--exclude"),
-            "inline excludes alongside a filters file would reintroduce the unprotected form"
-        );
-        assert!(
-            !args.iter().any(|a| a == "--resync"),
-            "an ordinary bi-sync must never rebuild the listings a filter change invalidated"
-        );
-
-        let resync = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", true).unwrap();
-        assert!(resync.iter().any(|a| a == "--resync"), "the migration path must opt in explicitly");
     }
 
     #[test]
@@ -2119,7 +2132,7 @@ mod tests {
     }
 
     fn progress_of(raw: &str) -> String {
-        match render_log_line(raw) {
+        match render_log_line(raw).0 {
             LogLine::Progress(text) => text,
             LogLine::Event(e) => panic!("a heartbeat became a log line: {:?}", e),
         }
@@ -2148,7 +2161,7 @@ mod tests {
         router.live.flush();
         let sent_log = router.live.sent_log.clone();
         let sent_progress = router.live.sent_progress.clone();
-        let text = router.finish();
+        let (text, _) = router.finish();
 
         // Both heartbeats reached the progress channel and nothing else did.
         assert_eq!(sent_progress.len(), 2, "every heartbeat must reach the progress row: {:?}", sent_progress);
@@ -2227,7 +2240,7 @@ mod tests {
             ),
         ];
         for (raw, expected) in cases {
-            match render_log_line(raw) {
+            match render_log_line(raw).0 {
                 LogLine::Event(text) => assert_eq!(text, expected),
                 LogLine::Progress(p) => panic!("an event became progress: {:?}", p),
             }
@@ -2245,7 +2258,7 @@ mod tests {
             "{ not json at all",
             "",
         ] {
-            match render_log_line(raw) {
+            match render_log_line(raw).0 {
                 LogLine::Event(text) => assert_eq!(text, raw),
                 LogLine::Progress(p) => panic!("{:?} was mistaken for progress: {:?}", raw, p),
             }

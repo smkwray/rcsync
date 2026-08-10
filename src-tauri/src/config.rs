@@ -65,6 +65,50 @@ pub struct UserConfig {
     pub rclone_transfers: Option<i32>,
 }
 
+/// The one rule for what an exclude pattern may be, applied where a pattern is
+/// SAVED and again where it is read.
+///
+/// Refusing rather than repairing is the point. rclone strips a filters-file
+/// line but hands a command-line value to its matcher untouched, so a padded
+/// pattern selects one set for the empty-source probe and another for the
+/// bi-sync that probe guards — and quietly trimming it on the way in makes the
+/// rule unreachable, untested, and false for any config edited by hand.
+///
+/// Order matters: a line break is rejected before anything else, so an entry
+/// that is only whitespace and a newline is refused rather than passed over as
+/// a blank row.
+pub fn validate_exclude_pattern(pattern: &str) -> Result<Option<&str>, String> {
+    if pattern.contains('\n') || pattern.contains('\r') {
+        return Err(format!(
+            "Exclude pattern contains a line break, which would forge extra filter rules: {:?}",
+            pattern
+        ));
+    }
+    // A row that is empty or only spaces is a blank line in a settings box, not
+    // a filter. Checked after the line-break rule above, so an entry that is
+    // whitespace *plus* a newline is refused rather than passed over as blank.
+    if pattern.trim().is_empty() {
+        return Ok(None);
+    }
+    if pattern != pattern.trim() {
+        return Err(format!(
+            "Exclude pattern has leading or trailing whitespace. rclone strips it from a filters \
+             file but not from a command-line argument, so the two would select different files. \
+             Remove the spaces: {:?}",
+            pattern
+        ));
+    }
+    Ok(Some(pattern))
+}
+
+/// Validate a whole list, rejecting on the first bad entry.
+pub fn validate_excludes(patterns: &[String]) -> Result<(), String> {
+    for p in patterns {
+        validate_exclude_pattern(p)?;
+    }
+    Ok(())
+}
+
 /// Accept only a bounded range. `i32` rather than a smaller unsigned type so a
 /// hand-edited negative still deserializes and reports a real error, instead of
 /// failing the whole-config parse and silently reverting every other setting.
@@ -393,6 +437,10 @@ pub fn load_config() -> AppConfig {
 /// Save only the private user config. Defaults are never written by the app.
 pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
     validate_rclone_transfers(cfg.rclone_transfers)?;
+    validate_excludes(&cfg.extra_excludes)?;
+    for project in &cfg.projects {
+        validate_excludes(&project.excludes)?;
+    }
     let user = UserConfig {
         rclone_path: cfg.rclone_path.clone(),
         remote: cfg.remote.clone(),
@@ -508,6 +556,78 @@ mod tests {
                 format!("onedrive:{}", cfg.project_remote_path(&p))
             );
         }
+    }
+
+    /// Point config reads and writes at a scratch file. Without this a failing
+    /// assertion below would let `save_config` overwrite the real user config
+    /// with a default one — a test that can destroy the thing it is testing.
+    /// The env var is process-wide, so every test that writes config must go
+    /// through here and they must not run concurrently with each other.
+    fn with_scratch_config<T>(body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "rcsync-cfg-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::env::set_var("RCSYNC_CONFIG", &path);
+        let out = body();
+        let _ = fs::remove_file(&path);
+        std::env::remove_var("RCSYNC_CONFIG");
+        out
+    }
+
+    fn cfg_with_excludes(extra: Vec<&str>, project: Vec<&str>) -> AppConfig {
+        AppConfig {
+            remote: "gdrive".into(),
+            extra_excludes: extra.into_iter().map(str::to_string).collect(),
+            projects: vec![Project {
+                name: "p".into(),
+                local_path: "~/p".into(),
+                remote_path: String::new(),
+                remote: "gdrive".into(),
+                excludes: project.into_iter().map(str::to_string).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    const DIVERGENT: [&str; 4] = [" leading/**", "trailing/** ", "break/**\n", "cr/**\r"];
+
+    /// The write path is where a bad pattern must be stopped. Trimming used to
+    /// happen here and in both UI forms, which silently repaired input and left
+    /// the rule unreachable from every production path — so the guarantee held
+    /// only for configs nobody edited by hand.
+    #[test]
+    fn saving_a_config_refuses_patterns_that_the_two_filter_forms_read_differently() {
+        with_scratch_config(|| {
+            for bad in DIVERGENT {
+                assert!(
+                    save_config(&cfg_with_excludes(vec![bad], vec![])).is_err(),
+                    "{:?} must be refused when saved, not repaired into agreement",
+                    bad
+                );
+                assert!(
+                    save_config(&cfg_with_excludes(vec![], vec![bad])).is_err(),
+                    "{:?} must be refused on a project too",
+                    bad
+                );
+            }
+            // A clean set still saves, so the rule is not simply refusing everything.
+            assert!(save_config(&cfg_with_excludes(vec!["node_modules/**"], vec!["artifacts/**"])).is_ok());
+        });
+    }
+
+    #[test]
+    fn a_blank_row_is_not_a_filter_but_a_blank_row_with_a_line_break_is_refused() {
+        assert_eq!(validate_exclude_pattern("").unwrap(), None);
+        assert_eq!(validate_exclude_pattern("   ").unwrap(), None);
+        assert!(
+            validate_exclude_pattern("  \n").is_err(),
+            "the line-break rule is checked first, so this is refused rather than skipped"
+        );
+        assert_eq!(validate_exclude_pattern("node_modules/**").unwrap(), Some("node_modules/**"));
     }
 
     #[test]

@@ -47,8 +47,11 @@
   }
 
   function addExclude() {
-    const val = newExclude.trim();
-    if (val && !editConfig.excludes.includes(val) && !editConfig.extra_excludes.includes(val)) {
+    // Not trimmed: the backend refuses a padded pattern rather than repairing
+    // it, because the padding means different things to a filters file and to a
+    // command-line argument.
+    const val = newExclude;
+    if (val.trim() && !editConfig.excludes.includes(val) && !editConfig.extra_excludes.includes(val)) {
       editConfig.extra_excludes = [...editConfig.extra_excludes, val];
       editConfig.excludes = [...editConfig.excludes, val];
       newExclude = "";
