@@ -110,6 +110,118 @@ struct LogEvent {
     lines: Vec<String>,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct ProgressEvent {
+    project: String,
+    text: String,
+}
+
+/// One line of rclone's structured log, sorted by what it is worth doing with.
+enum LogLine {
+    /// A stats heartbeat. The same counters re-reported on a timer, so it is a
+    /// snapshot to display, never an event to append: as a log line it produced
+    /// page after page of identical text whenever a transfer sat still.
+    Progress(String),
+    /// Something that actually happened, worth a line of its own.
+    Event(String),
+}
+
+/// Turn a line of `--use-json-log` output into something worth showing.
+///
+/// Anything that is not a JSON record with a message passes through untouched —
+/// that is how the empty-source probe, which is given no `--use-json-log`, keeps
+/// working, and it means a future rclone that changes the schema degrades to raw
+/// text instead of losing the line.
+fn render_log_line(raw: &str) -> LogLine {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let Some(record) = parsed.as_ref().filter(|v| v.get("msg").is_some()) else {
+        return LogLine::Event(raw.to_string());
+    };
+    if let Some(stats) = record.get("stats") {
+        return LogLine::Progress(format_progress(stats));
+    }
+
+    let msg = record.get("msg").and_then(|m| m.as_str()).unwrap_or("").trim();
+    let mut out = String::new();
+    // Only levels that change how the line should be read get a marker. Tagging
+    // "info" too would put a word in front of every one of thousands of lines.
+    match record.get("level").and_then(|l| l.as_str()) {
+        Some("error") => out.push_str("ERROR "),
+        Some("warning") => out.push_str("WARNING "),
+        Some("notice") => out.push_str("NOTICE "),
+        _ => {}
+    }
+    if let Some(object) = record.get("object").and_then(|o| o.as_str()) {
+        if !object.is_empty() {
+            out.push_str(object);
+            out.push_str(": ");
+        }
+    }
+    out.push_str(msg);
+    LogLine::Event(out)
+}
+
+/// A stats snapshot as one compact line, built from rclone's numbers rather
+/// than from the prose block it also prints — so a check reports what it has
+/// checked, and a transfer reports what it has moved, without either padding
+/// the line with the other's zeroes.
+fn format_progress(stats: &serde_json::Value) -> String {
+    let num = |k: &str| stats.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let mut parts: Vec<String> = Vec::new();
+
+    let (bytes, total_bytes) = (num("bytes"), num("totalBytes"));
+    if total_bytes > 0.0 {
+        parts.push(format!("{} / {}", human_bytes(bytes), human_bytes(total_bytes)));
+        parts.push(format!("{:.0}%", bytes / total_bytes * 100.0));
+    }
+    if num("speed") > 0.0 {
+        parts.push(format!("{}/s", human_bytes(num("speed"))));
+    }
+    // Null once nothing is left to estimate, which is not the same as zero.
+    if let Some(eta) = stats.get("eta").and_then(serde_json::Value::as_f64) {
+        parts.push(format!("ETA {}", human_duration(eta)));
+    }
+    if num("totalTransfers") > 0.0 {
+        parts.push(format!("{} / {} files", num("transfers") as i64, num("totalTransfers") as i64));
+    }
+    if num("totalChecks") > 0.0 {
+        parts.push(format!("{} / {} checked", num("checks") as i64, num("totalChecks") as i64));
+    }
+    let errors = num("errors") as i64;
+    if errors > 0 {
+        parts.push(format!("{} error{}", errors, if errors == 1 { "" } else { "s" }));
+    }
+    // A run that has listed nothing yet still has to say it is alive.
+    if parts.is_empty() {
+        parts.push(format!("starting — {} elapsed", human_duration(num("elapsedTime"))));
+    }
+    parts.join(" · ")
+}
+
+fn human_bytes(n: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut n = n.max(0.0);
+    let mut unit = 0;
+    while n >= 1024.0 && unit < UNITS.len() - 1 {
+        n /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{:.0} {}", n, UNITS[unit])
+    } else {
+        format!("{:.2} {}", n, UNITS[unit])
+    }
+}
+
+fn human_duration(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as i64;
+    match (s / 3600, (s % 3600) / 60, s % 60) {
+        (0, 0, sec) => format!("{}s", sec),
+        (0, min, sec) => format!("{}m{}s", min, sec),
+        (hr, min, _) => format!("{}h{}m", hr, min),
+    }
+}
+
 /// How long a line may wait for company before being sent on its own.
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -156,6 +268,18 @@ impl LiveLog {
             );
         }
         self.last_flush = Instant::now();
+    }
+
+    /// The latest progress snapshot, on its own channel so the UI can render it
+    /// in one place that updates rather than appending. Not batched: rclone
+    /// already emits these on a timer, and only the newest one matters.
+    fn progress(&mut self, text: &str) {
+        if let Some(app) = APP.get() {
+            let _ = app.emit(
+                "rclone-progress",
+                ProgressEvent { project: self.project.clone(), text: text.to_string() },
+            );
+        }
     }
 }
 
@@ -223,29 +347,28 @@ fn build_transfer_args(cfg: &AppConfig) -> Result<Vec<String>, String> {
     })
 }
 
-/// A progress heartbeat for a transfer. Formatting only — unlike `--transfers`,
-/// these change what rclone *prints*, never what it selects or moves, so there
-/// is no user setting for them to override.
+/// Structured output and a progress heartbeat. Formatting only — unlike
+/// `--transfers`, these change what rclone *prints*, never what it selects or
+/// moves, so there is no user setting for them to override.
 ///
-/// One line every 10 s instead of rclone's default eleven-line block every
-/// minute. The interval alone would have made things worse: at 10 s the default
-/// block would bury the per-file lines it is meant to sit beside.
-fn transfer_stats_args() -> Vec<String> {
-    vec!["--stats".into(), "10s".into(), "--stats-one-line".into()]
+/// `--use-json-log` is what makes a heartbeat distinguishable from an event:
+/// stats records carry a `stats` object, and nothing else does. Recognising them
+/// by their prose instead would be the same guess-from-human-text mistake that
+/// once let an auth failure read as "in sync". Two seconds is affordable
+/// precisely because a heartbeat no longer costs a log line.
+fn transfer_log_args() -> Vec<String> {
+    vec!["--use-json-log".into(), "--stats".into(), "2s".into()]
 }
 
-/// A progress heartbeat for a check, which transfers nothing — so the one-line
-/// form is useless here (it reports bytes moved, always zero) and the full block
-/// is what carries `Checks: n / m`, the only real measure of how far along a
-/// check is.
-///
-/// `--stats-log-level NOTICE` rather than `-v`: stats print at INFO, and turning
-/// the whole run up to INFO would add a log line per difference on top of the
-/// itemized verdict the app already builds from `--combined`.
-fn check_stats_args() -> Vec<String> {
+/// The same for a check, which is given no `-v`: stats print at INFO, so without
+/// `--stats-log-level` there would be no heartbeat at all, and raising the whole
+/// run to INFO would add a line per difference on top of the itemized verdict
+/// the app already builds from `--combined`.
+fn check_log_args() -> Vec<String> {
     vec![
+        "--use-json-log".into(),
         "--stats".into(),
-        "15s".into(),
+        "2s".into(),
         "--stats-log-level".into(),
         "NOTICE".into(),
     ]
@@ -348,18 +471,9 @@ fn resolve_rclone(cfg: &AppConfig) -> String {
 fn drain<R: Read>(
     pipe: Option<R>,
     which: &str,
-    mut on_line: Option<&mut dyn FnMut(&str)>,
-) -> Result<String, String> {
-    let mut all = String::new();
-    let Some(mut pipe) = pipe else { return Ok(all) };
-
-    let mut emit = |text: &str, all: &mut String| {
-        if let Some(f) = on_line.as_mut() {
-            f(text);
-        }
-        all.push_str(text);
-        all.push('\n');
-    };
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let Some(mut pipe) = pipe else { return Ok(()) };
 
     let mut buf = [0u8; 8192];
     let mut partial: Vec<u8> = Vec::new();
@@ -374,15 +488,14 @@ fn drain<R: Read>(
         while let Some(nl) = partial.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = partial.drain(..=nl).collect();
             let text = String::from_utf8_lossy(&line[..nl]);
-            emit(text.trim_end_matches('\r'), &mut all);
+            on_line(text.trim_end_matches('\r'));
         }
     }
     // Whatever rclone wrote without a closing newline is still output.
     if !partial.is_empty() {
-        let text = String::from_utf8_lossy(&partial).into_owned();
-        emit(&text, &mut all);
+        on_line(&String::from_utf8_lossy(&partial));
     }
-    Ok(all)
+    Ok(())
 }
 
 /// Run rclone and return combined stdout+stderr as a string. `key` is the
@@ -409,19 +522,39 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<(String, i3
     // check's verdict under one line per matching file.
     let out_reader = std::thread::spawn({
         let stdout = child.take_stdout();
-        move || drain(stdout, "stdout", None)
+        move || -> Result<String, String> {
+            let mut text = String::new();
+            drain(stdout, "stdout", &mut |line| {
+                text.push_str(line);
+                text.push('\n');
+            })?;
+            Ok(text)
+        }
     });
     let err_reader = std::thread::spawn({
         let stderr = child.take_stderr();
         let key = key.to_string();
-        move || {
+        move || -> Result<String, String> {
+            let mut text = String::new();
             let mut live = LiveLog::new(&key);
-            let mut sink = |line: &str| live.push(line);
-            let result = drain(stderr, "stderr", Some(&mut sink));
-            drop(sink);
+            let read = {
+                let mut sink = |raw: &str| match render_log_line(raw) {
+                    LogLine::Progress(snapshot) => live.progress(&snapshot),
+                    LogLine::Event(line) => {
+                        live.push(&line);
+                        text.push_str(&line);
+                        text.push('\n');
+                    }
+                };
+                drain(stderr, "stderr", &mut sink)
+            };
             // Whatever the last batch was waiting for company, send it now.
             live.flush();
-            result
+            read?;
+            // Heartbeats are deliberately absent from the returned output: they
+            // are a view of the run, not a record of it, and callers turn this
+            // text into error messages and verdicts.
+            Ok(text)
         }
     });
 
@@ -606,7 +739,7 @@ pub fn sync_project(
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
     args.extend(build_transfer_args(cfg)?);
-    args.extend(transfer_stats_args());
+    args.extend(transfer_log_args());
     args.push("-v".to_string());
     if dry_run {
         args.push("--dry-run".to_string());
@@ -631,7 +764,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
     args.extend(build_transfer_args(cfg)?);
-    args.extend(transfer_stats_args());
+    args.extend(transfer_log_args());
     args.push("-v".to_string());
 
     let (output, code) = run_rclone(cfg, &project.name, &args)?;
@@ -655,7 +788,7 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome,
     ];
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
-    args.extend(check_stats_args());
+    args.extend(check_log_args());
 
     let (raw_output, code) = run_rclone(cfg, &project.name, &args)?;
     parse_check_output(&raw_output, code)
@@ -692,18 +825,12 @@ fn parse_check_output(raw: &str, code: i32) -> Result<CheckOutcome, String> {
             // rclone could not read the file on one side; it has no verdict for
             // it, so neither do we.
             "! " => { unreadable += 1; "UNREADABLE" }
-            _ => {
-                // A periodic stats block opens with a bare `NOTICE:` and puts
-                // its numbers on the following lines, so the message itself is
-                // empty — a blank line in the verdict, not a notice.
-                if let Some(msg) = line.split("NOTICE: ").nth(1) {
-                    if !msg.trim().is_empty() {
-                        details.push_str(msg);
-                        details.push('\n');
-                    }
-                }
-                continue;
-            }
+            // Everything else on this stream is rclone's own log, which now
+            // reaches the user live and in full. Copying its notices into the
+            // verdict as well printed each one twice, and did it by fishing for
+            // the substring "NOTICE: " — the same guess-from-human-text habit
+            // that once let an unreachable remote read as "in sync".
+            _ => continue,
         };
         if marker != "! " {
             differences += 1;
@@ -1042,7 +1169,7 @@ mod tests {
                     first_seen = Some(start.elapsed());
                 }
             };
-            drain(stdout, "stdout", Some(&mut sink)).unwrap();
+            drain(stdout, "stdout", &mut sink).unwrap();
         }
         let _ = child.wait();
 
@@ -1066,10 +1193,10 @@ mod tests {
         // name, and a run's last line often has no closing newline.
         let raw: Vec<u8> = b"first\r\nsecond \xff\xfe name\nno trailing newline".to_vec();
         let mut seen: Vec<String> = Vec::new();
-        let all = {
+        {
             let mut sink = |line: &str| seen.push(line.to_string());
-            drain(Some(&raw[..]), "stdout", Some(&mut sink)).unwrap()
-        };
+            drain(Some(&raw[..]), "stdout", &mut sink).unwrap();
+        }
 
         assert_eq!(seen.len(), 3, "got {:?}", seen);
         assert_eq!(seen[0], "first", "a CRLF line must not carry \\r into the log");
@@ -1079,7 +1206,6 @@ mod tests {
             seen[1]
         );
         assert_eq!(seen[2], "no trailing newline");
-        assert_eq!(all.lines().collect::<Vec<_>>(), seen, "the returned output and the streamed lines must be the same text");
     }
 
     // --- failure reporting: enough context, not a second copy of the run ---
@@ -1236,20 +1362,122 @@ mod tests {
     }
 
     #[test]
-    fn a_stats_block_does_not_become_a_notice_in_the_verdict() {
-        // The periodic progress block opens with a bare `NOTICE:` and puts its
-        // numbers on the lines below, so treating the message as a notice adds
-        // a blank line to the verdict for every heartbeat of a long check.
-        let raw = "= a.txt\n2026/08/10 11:06:45 NOTICE: \nChecks: 1 / 1, 100%\n\
-                   2026/08/10 11:06:45 NOTICE: real message\n";
-        let out = parse_check_output(raw, 0).unwrap();
-        assert!(out.synced);
-        assert!(out.details.contains("real message"), "a genuine notice must still be kept");
-        assert!(
-            !out.details.contains("\n\n"),
-            "the empty stats notice leaked into the verdict: {:?}",
-            out.details
+    fn the_verdict_itemizes_only_comparisons_not_rclone_log_noise() {
+        // rclone's own log reaches the user live and in full now, so the verdict
+        // is built from `--combined` markers alone. It used to also fish for the
+        // substring "NOTICE: ", which printed each notice twice and put a blank
+        // line in the verdict for every heartbeat of a long check.
+        let raw = "= a.txt\n* b.txt\nNOTICE Local file system: 1 differences found\n\
+                   2026/08/10 11:06:45 NOTICE: \nChecks: 1 / 1, 100%\n";
+        let out = parse_check_output(raw, 1).unwrap();
+        assert_eq!((out.differences, out.matches), (1, 1));
+        assert_eq!(
+            out.details, "[CHANGED] b.txt\n1 differences, 1 matching.\n",
+            "the verdict must carry the comparison and the app's own summary, nothing else"
         );
+    }
+
+    // --- structured log: a heartbeat is a snapshot, not an event ---
+
+    fn stats_record(fields: &str) -> String {
+        format!(
+            "{{\"level\":\"info\",\"msg\":\"\\nTransferred: ...\",\"stats\":{{{}}}}}",
+            fields
+        )
+    }
+
+    fn progress_of(raw: &str) -> String {
+        match render_log_line(raw) {
+            LogLine::Progress(text) => text,
+            LogLine::Event(e) => panic!("a heartbeat became a log line: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn a_stats_record_is_progress_and_never_a_log_line() {
+        // The complaint that forced this: at 100% with nothing moving, every
+        // heartbeat carried identical text, and appending them filled the panel
+        // with page after page of the same line.
+        let text = progress_of(&stats_record(
+            "\"bytes\":330079,\"totalBytes\":330079,\"speed\":9198.0,\"eta\":0,\
+             \"transfers\":12,\"totalTransfers\":12,\"errors\":4",
+        ));
+        for expected in ["322.34 KiB / 322.34 KiB", "100%", "ETA 0s", "12 / 12 files", "4 errors"] {
+            assert!(text.contains(expected), "{:?} missing from {:?}", expected, text);
+        }
+    }
+
+    #[test]
+    fn a_check_reports_checks_and_a_transfer_reports_bytes() {
+        // Whichever counter is meaningless for the command must stay off the
+        // line, or a check reads "0 B / 0 B, 100%" and a push reads "0 checked".
+        let check = progress_of(&stats_record("\"checks\":900,\"totalChecks\":48471"));
+        assert!(check.contains("900 / 48471 checked"), "{:?}", check);
+        assert!(!check.contains("files") && !check.contains(" / 0 B"), "{:?}", check);
+
+        let push = progress_of(&stats_record("\"transfers\":3,\"totalTransfers\":9"));
+        assert!(push.contains("3 / 9 files"), "{:?}", push);
+        assert!(!push.contains("checked"), "{:?}", push);
+    }
+
+    #[test]
+    fn a_run_with_nothing_counted_yet_still_says_it_is_alive() {
+        let text = progress_of(&stats_record("\"elapsedTime\":73.4"));
+        assert!(text.contains("1m13s"), "{:?}", text);
+    }
+
+    #[test]
+    fn an_event_keeps_its_object_and_marks_only_levels_worth_marking() {
+        let cases: [(&str, &str); 3] = [
+            (
+                r#"{"level":"info","msg":"Copied (new)","object":"src/main.ts"}"#,
+                "src/main.ts: Copied (new)",
+            ),
+            (
+                r#"{"level":"error","msg":"failed to open source object: permission denied","object":"data/locked.md"}"#,
+                "ERROR data/locked.md: failed to open source object: permission denied",
+            ),
+            (
+                r#"{"level":"notice","msg":"Can't follow symlink without -L/--copy-links","object":"scripts/alias.py"}"#,
+                "NOTICE scripts/alias.py: Can't follow symlink without -L/--copy-links",
+            ),
+        ];
+        for (raw, expected) in cases {
+            match render_log_line(raw) {
+                LogLine::Event(text) => assert_eq!(text, expected),
+                LogLine::Progress(p) => panic!("an event became progress: {:?}", p),
+            }
+        }
+    }
+
+    #[test]
+    fn anything_that_is_not_a_json_log_record_survives_untouched() {
+        // The empty-source probe is given no --use-json-log, and a future rclone
+        // could change the schema. Either way the line must reach the log as it
+        // stands rather than vanish into a failed parse.
+        for raw in [
+            "NOTICE: Config file not found",
+            "{\"count\":42,\"bytes\":1234}", // JSON, but not a log record
+            "{ not json at all",
+            "",
+        ] {
+            match render_log_line(raw) {
+                LogLine::Event(text) => assert_eq!(text, raw),
+                LogLine::Progress(p) => panic!("{:?} was mistaken for progress: {:?}", raw, p),
+            }
+        }
+    }
+
+    #[test]
+    fn sizes_and_durations_read_the_way_a_person_would_write_them() {
+        assert_eq!(human_bytes(0.0), "0 B");
+        assert_eq!(human_bytes(999.0), "999 B");
+        assert_eq!(human_bytes(1024.0), "1.00 KiB");
+        assert_eq!(human_bytes(2_513_500_000.0), "2.34 GiB");
+        assert_eq!(human_duration(0.0), "0s");
+        assert_eq!(human_duration(45.4), "45s");
+        assert_eq!(human_duration(125.0), "2m5s");
+        assert_eq!(human_duration(40218.0), "11h10m");
     }
 
     #[test]
