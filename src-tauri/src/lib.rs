@@ -512,24 +512,27 @@ mod command_tests {
     /// coverage went through `save_config` instead.
     #[test]
     fn the_ignore_editor_command_refuses_a_pattern_it_would_otherwise_repair() {
-        let path = std::env::temp_dir().join(format!("rcsync-cmd-{}.json", std::process::id()));
-        std::env::set_var("RCSYNC_CONFIG", &path);
+        let _env = config::TestConfigEnv::new("ignore-command");
+        let mut initial = AppConfig::default();
+        initial.projects = vec![Project {
+            name: "p".into(),
+            local_path: "~/p".into(),
+            remote_path: String::new(),
+            remote: "gdrive".into(),
+            excludes: Vec::new(),
+        }];
+        save_config(&initial).unwrap();
 
-        let outcomes: Vec<Result<(), String>> = [" leading/**", "trailing/** ", "break/**\n"]
+        let bad_patterns = [" leading/**", "trailing/** ", "break/**\n", "cr/**\r"];
+        let outcomes: Vec<Result<(), String>> = bad_patterns
             .iter()
             .map(|bad| set_project_excludes("p".into(), vec![bad.to_string()]))
             .collect();
-        // A blank row is not a filter and must still be accepted and dropped.
-        let blank = set_project_excludes("p".into(), vec!["   ".into()]);
 
-        let _ = std::fs::remove_file(&path);
-        std::env::remove_var("RCSYNC_CONFIG");
-
-        // Asserted on the REASON, not merely on Err. This command also fails
-        // when the project is unknown, so `is_err()` alone cannot tell a
-        // validation rejection from an unrelated one — and a first version of
-        // this test passed even with the trim reinstated because of exactly that.
-        for (bad, outcome) in [" leading/**", "trailing/** ", "break/**\n"].iter().zip(&outcomes) {
+        // Asserted on the REASON, not merely on Err. The first version used an
+        // unknown project, so an unrelated lookup failure made a reinstated
+        // trim look correctly rejected.
+        for (bad, outcome) in bad_patterns.iter().zip(&outcomes) {
             let err = outcome.as_ref().expect_err(&format!("{:?} must be rejected", bad));
             assert!(
                 err.contains("whitespace") || err.contains("line break"),
@@ -539,10 +542,12 @@ mod command_tests {
                 err
             );
         }
-        // Not asserting Ok: the project does not exist, so this fails for an
-        // unrelated reason. What must not happen is a *validation* rejection.
-        if let Err(e) = blank {
-            assert!(!e.contains("whitespace"), "a blank row is not a filter: {}", e);
-        }
+
+        // Positive controls through the same command: blank rows are dropped,
+        // and an accepted pattern is persisted exactly rather than canonicalised.
+        set_project_excludes("p".into(), vec!["   ".into()]).unwrap();
+        assert!(load_config().projects[0].excludes.is_empty());
+        set_project_excludes("p".into(), vec!["artifacts/**".into()]).unwrap();
+        assert_eq!(load_config().projects[0].excludes, vec!["artifacts/**"]);
     }
 }
