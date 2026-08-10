@@ -223,7 +223,7 @@
       return;
     }
     if (log) appendLog(`[${name}] Cancelled.`);
-    if (mode === "push" || mode === "pull" || mode === "bisync") {
+    if (mode === "push" || mode === "pull" || mode === "bisync" || mode === "resync") {
       setStatus(name, "modified", -1);
     }
     if (mode === "bisync" && log) {
@@ -276,6 +276,19 @@
       );
       if (!ok) return;
     }
+    if (mode === "resync") {
+      const ok = await customConfirm(
+        `Rebuild bi-sync listings for "${project.name}"?`,
+        `Use this only when a bi-sync refused because this project's excludes changed.\n\n` +
+        `A resync discards the stored comparison state and rebuilds it from what is on disk now. ` +
+        `rclone resolves any difference in favour of LOCAL, so a file that differs on ${project.remote} ` +
+        `will be overwritten by the local copy. It cannot tell which version you wanted.`,
+        "Rebuild Listings",
+        true,
+        "resync",
+      );
+      if (!ok) return;
+    }
     if (mode === "bisync") {
       const ok = await customConfirm(
         `Bi-Sync "${project.name}"?`,
@@ -304,6 +317,8 @@
         await invoke<string>("pull", { projectName: project.name, dryRun: false });
       } else if (mode === "bisync") {
         await invoke<string>("bisync", { projectName: project.name });
+      } else if (mode === "resync") {
+        await invoke<string>("bisync_resync", { projectName: project.name });
       } else if (mode === "check") {
         const outcome = await invoke<CheckOutcome>("check", { projectName: project.name });
         applyCheckOutcome(project.name, outcome);

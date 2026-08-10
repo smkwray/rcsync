@@ -53,7 +53,7 @@ export interface ProjectStatus {
   exists_locally: boolean;
 }
 
-export type SyncMode = "push" | "pull" | "check" | "dry-run" | "bisync";
+export type SyncMode = "push" | "pull" | "check" | "dry-run" | "bisync" | "resync";
 
 /** The modes that have an "all projects" variant. A subset of SyncMode, so a
  *  bulk run can be logged and cancelled through the same per-project paths. */

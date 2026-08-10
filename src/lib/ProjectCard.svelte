@@ -37,6 +37,10 @@
     { mode: "dry-run", label: "Dry Run", cls: "" },
     { mode: "check", label: "Check", cls: "" },
     { mode: "bisync", label: "Bi-Sync", cls: "warn" },
+    // Recovery for a bi-sync that rclone refused because this project's filter
+    // set changed. Destructive in its own right — it resolves toward local — so
+    // it carries its own typed confirmation rather than sharing Bi-Sync's.
+    { mode: "resync", label: "Resync", cls: "danger" },
     { mode: "pull", label: "Pull", cls: "danger" },
   ];
 
@@ -146,6 +150,7 @@
       case "push": return "pushing";
       case "pull": return "pulling";
       case "bisync": return "bi-syncing";
+      case "resync": return "rebuilding listings";
       case "dry-run": return "dry run";
       default: return "syncing";
     }

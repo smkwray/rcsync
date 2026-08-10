@@ -219,6 +219,19 @@ async fn check(project_name: String) -> Result<rclone::CheckOutcome, String> {
 
 #[tauri::command]
 async fn bisync(project_name: String) -> Result<String, String> {
+    run_bisync(project_name, false).await
+}
+
+/// Rebuild a project's bi-sync listings. Separate from `bisync` so the ordinary
+/// button cannot reach it: a resync is how a filter change is migrated, and
+/// rclone resolves it by giving the local side precedence, so it can overwrite
+/// the remote. The frontend gates it behind its own typed confirmation.
+#[tauri::command]
+async fn bisync_resync(project_name: String) -> Result<String, String> {
+    run_bisync(project_name, true).await
+}
+
+async fn run_bisync(project_name: String, resync: bool) -> Result<String, String> {
     let _op = rclone::start_op(&project_name)?;
     let cfg = load_config();
     let project = find_project(&cfg, &project_name)?;
@@ -226,7 +239,7 @@ async fn bisync(project_name: String) -> Result<String, String> {
     rclone::check_cancelled(&project_name)?;
     let cfg2 = cfg.clone();
     let proj2 = project.clone();
-    tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2))
+    tokio::task::spawn_blocking(move || bisync_project(&cfg2, &proj2, resync))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -455,6 +468,7 @@ pub fn run() {
             pull,
             check,
             bisync,
+            bisync_resync,
             cancel_op,
             delete_local,
             open_folder,
