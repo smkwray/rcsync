@@ -38,7 +38,11 @@
 <div class="overlay" role="dialog" onkeydown={handleKey}>
   <div class="dialog">
     <h3>{title}</h3>
-    <p class="msg">{@html message.replace(/\n/g, "<br>")}</p>
+    <!-- Escaped text, never {@html}. These messages interpolate project names,
+         remote names and local paths, so raw rendering would let a crafted path
+         inject markup into the one dialog whose job is to be trustworthy before
+         something destructive happens. Line breaks come from CSS instead. -->
+    <p class="msg">{message}</p>
     {#if requirePhrase}
       <input
         class="phrase-input"
@@ -90,6 +94,8 @@
     color: var(--text-muted);
     line-height: 1.6;
     margin-bottom: 18px;
+    /* Carries the line breaks that used to be injected as <br>. */
+    white-space: pre-wrap;
   }
 
   .actions {

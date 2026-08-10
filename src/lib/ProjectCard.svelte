@@ -150,7 +150,7 @@
       case "push": return "pushing";
       case "pull": return "pulling";
       case "bisync": return "bi-syncing";
-      case "resync": return "rebuilding listings";
+      case "resync": return "resyncing";
       case "dry-run": return "dry run";
       default: return "syncing";
     }
