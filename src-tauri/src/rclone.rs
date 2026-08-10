@@ -205,9 +205,18 @@ fn format_progress(stats: &serde_json::Value) -> String {
     if errors > 0 {
         parts.push(format!("{} error{}", errors, if errors == 1 { "" } else { "s" }));
     }
-    // A run that has listed nothing yet still has to say it is alive.
+    // Before rclone finishes its first listing every total is still zero, and on
+    // a large remote that phase runs for minutes — long enough that an elapsed
+    // counter alone reads as a hang. `listed` is the one counter moving during
+    // it, so it is what the row should show.
     if parts.is_empty() {
-        parts.push(format!("starting — {} elapsed", human_duration(num("elapsedTime"))));
+        let listed = num("listed") as i64;
+        let elapsed = human_duration(num("elapsedTime"));
+        parts.push(if listed > 0 {
+            format!("scanning — {} listed · {} elapsed", listed, elapsed)
+        } else {
+            format!("starting — {} elapsed", elapsed)
+        });
     }
     parts.join(" · ")
 }
@@ -2366,10 +2375,26 @@ esac
         assert!(!push.contains("checked"), "{:?}", push);
     }
 
+    /// The listing phase is the longest part of a Drive push and every total is
+    /// still zero throughout it, so the row would otherwise show nothing but a
+    /// ticking clock — which reads as a hang. `listed` is the counter that moves.
     #[test]
-    fn a_run_with_nothing_counted_yet_still_says_it_is_alive() {
-        let text = progress_of(&stats_record("\"elapsedTime\":73.4"));
-        assert!(text.contains("1m13s"), "{:?}", text);
+    fn the_listing_phase_reports_what_it_has_listed_rather_than_only_a_clock() {
+        let scanning = progress_of(&stats_record("\"listed\":12431,\"elapsedTime\":73.4"));
+        assert!(scanning.contains("12431 listed"), "{:?}", scanning);
+        assert!(scanning.contains("1m13s"), "{:?}", scanning);
+
+        // Genuinely nothing yet: still say it is alive.
+        let starting = progress_of(&stats_record("\"elapsedTime\":2.0"));
+        assert!(starting.contains("starting"), "{:?}", starting);
+        assert!(starting.contains("2s"), "{:?}", starting);
+
+        // Once real totals arrive, they take over from the scan counter.
+        let transferring = progress_of(&stats_record(
+            "\"listed\":9,\"bytes\":50,\"totalBytes\":100,\"transfers\":1,\"totalTransfers\":2",
+        ));
+        assert!(transferring.contains("1 / 2 files"), "{:?}", transferring);
+        assert!(!transferring.contains("listed"), "scan text must not linger: {:?}", transferring);
     }
 
     #[test]
