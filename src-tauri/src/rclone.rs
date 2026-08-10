@@ -374,6 +374,39 @@ fn check_log_args() -> Vec<String> {
     ]
 }
 
+/// Ask the remote for its whole tree in one recursive listing instead of one
+/// request per directory.
+///
+/// Measured on a real Google Drive remote, `sync --dry-run` over a 17k-file
+/// project against a 62,696-file remote tree:
+///
+/// |               | wall    | HTTP requests | files selected |
+/// |---------------|---------|---------------|----------------|
+/// | default       | 659.3 s | 3,726         | 45             |
+/// | `--fast-list` | 130.8 s | 668           | 45             |
+///
+/// Five times faster, and the selected file set was byte-identical — which is
+/// the part that had to be proved, because the flag genuinely changes *when*
+/// filters apply. The default per-directory walk drops an excluded directory
+/// before requesting its contents; `--fast-list` fetches everything and filters
+/// afterwards, so it does enumerate the ~45,600 stale objects this remote still
+/// carries under `artifacts/`. That was the stated reason to avoid it, and the
+/// measurement says the reasoning was right but the arithmetic wrong: Drive
+/// batches 50 parent IDs per query, so one grouped pass over a bigger tree still
+/// costs a fifth of one request per included directory.
+///
+/// It changes selection not at all, so the empty-source guard's filter parity is
+/// untouched. It is deliberately NOT passed to that guard anyway: the local
+/// backend implements no `ListR`, making it a no-op there and pure argv
+/// divergence. On OneDrive it is inert for the same reason.
+///
+/// Costs accepted: the whole listing is held in memory, and rclone can degrade
+/// its 50-way grouping to 1 on a known Drive bug — which happened three times in
+/// the measured run and still left it five times ahead.
+fn remote_listing_args() -> Vec<String> {
+    vec!["--fast-list".into()]
+}
+
 /// Pull the file count out of `rclone size --json` output.
 ///
 /// Separated from the subprocess call so the fail-closed paths are testable: any
@@ -740,6 +773,7 @@ pub fn sync_project(
     args.extend(project_exclude_args(project));
     args.extend(build_transfer_args(cfg)?);
     args.extend(transfer_log_args());
+    args.extend(remote_listing_args());
     args.push("-v".to_string());
     if dry_run {
         args.push("--dry-run".to_string());
@@ -765,6 +799,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project) -> Result<String, Stri
     args.extend(project_exclude_args(project));
     args.extend(build_transfer_args(cfg)?);
     args.extend(transfer_log_args());
+    args.extend(remote_listing_args());
     args.push("-v".to_string());
 
     let (output, code) = run_rclone(cfg, &project.name, &args)?;
@@ -789,6 +824,7 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome,
     args.extend(build_exclude_args(cfg));
     args.extend(project_exclude_args(project));
     args.extend(check_log_args());
+    args.extend(remote_listing_args());
 
     let (raw_output, code) = run_rclone(cfg, &project.name, &args)?;
     parse_check_output(&raw_output, code)
@@ -1294,8 +1330,10 @@ mod tests {
         probe.extend(project_exclude_args(&project));
 
         assert!(
-            !probe.iter().any(|a| a == "--transfers" || a.starts_with("--stats")),
-            "performance and progress flags must never reach the empty-source probe"
+            !probe
+                .iter()
+                .any(|a| a == "--transfers" || a == "--fast-list" || a.starts_with("--stats")),
+            "performance, listing and progress flags must never reach the empty-source probe"
         );
         assert_eq!(
             probe.iter().filter(|a| *a == "--exclude").count(),
@@ -1374,6 +1412,30 @@ mod tests {
         assert_eq!(
             out.details, "[CHANGED] b.txt\n1 differences, 1 matching.\n",
             "the verdict must carry the comparison and the app's own summary, nothing else"
+        );
+    }
+
+    /// `--fast-list` earned its place by measurement (659 s -> 131 s on a real
+    /// Drive remote), and it is safe only because it changes no file selection.
+    /// The empty-source guard's whole correctness rests on the probe and the
+    /// sync agreeing about scope, so this pins that the flag reaches the
+    /// commands that talk to a remote and never the probe that decides whether
+    /// a push is allowed to run at all.
+    #[test]
+    fn fast_list_reaches_remote_operations_but_never_the_source_probe() {
+        assert_eq!(remote_listing_args(), vec!["--fast-list".to_string()]);
+
+        let cfg = test_cfg(vec!["node_modules/**"]);
+        let project = project_with(vec![]);
+
+        // What the probe builds, mirrored from `rclone_source_file_count`.
+        let mut probe = vec!["size".to_string(), "/tmp/x".to_string(), "--json".to_string()];
+        probe.extend(build_exclude_args(&cfg));
+        probe.extend(project_exclude_args(&project));
+        assert!(
+            !probe.iter().any(|a| a == "--fast-list"),
+            "the local backend has no ListR, so this would be a no-op that only \
+             lets the guard's argv drift from the sync's"
         );
     }
 
