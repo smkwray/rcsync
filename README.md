@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Built with <a href="https://tauri.app">Tauri v2</a> + <a href="https://svelte.dev">Svelte 5</a>. Cross-platform (macOS, Windows, Linux).
+  Built with <a href="https://tauri.app">Tauri v2</a> + <a href="https://svelte.dev">Svelte 5</a>. Configured to target macOS, Windows, and Linux.
 </p>
 
 <p align="center">
@@ -28,7 +28,9 @@
 - **Multi-remote** support — switch between cloud drives with pill tabs
 - **Keyboard-driven** — vim-style navigation, single-key actions
 - **Pin projects** to the top of the dashboard (persists across sessions)
-- **Portable config** — syncs between devices via Syncthing or similar
+- **Scheduled Push** — push a project on an interval or selected weekdays while rcsync is open
+- **Shared project config** — project definitions can sync between devices via Syncthing or similar; automation stays device-local
+- **Retired-target protection** — an explicit local deletion is recorded against its exact remote target, so a stale leftover discovered on another device cannot be pushed back without reattaching it
 
 ### Design philosophy
 
@@ -37,6 +39,12 @@
 Defaults are merged into your filter set and cannot be removed from configuration, so they are kept deliberately narrow: caches, virtualenvs, build output, VCS metadata and OS junk. Anything specific to how *you* organise a project belongs in `extra_excludes`, not here.
 
 ## Prerequisites
+
+Building from source requires Node.js 18 or newer with npm, Rust with the
+stable toolchain, and the platform prerequisites listed in the
+[Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/). The
+release configuration targets macOS, Windows, and Linux; local release
+validation is recorded separately for each platform.
 
 ### 1. Install rclone
 
@@ -102,8 +110,8 @@ After that, rcsync handles all subsequent syncs through the UI.
 ```bash
 git clone https://github.com/smkwray/rcsync.git
 cd rcsync
-npm install
-npx tauri build
+npm ci
+npm run tauri build
 ```
 
 The built app is at `src-tauri/target/release/bundle/`.
@@ -111,12 +119,12 @@ The built app is at `src-tauri/target/release/bundle/`.
 ### Development
 
 ```bash
-npx tauri dev
+npm run tauri dev
 ```
 
 ## Configuration
 
-rcsync uses two config files:
+rcsync uses a shared project config and a device-local automation config:
 
 ### `defaults.json` (public, ships with the app)
 
@@ -135,9 +143,12 @@ Contains exclude patterns and default scan directories. Safe to check into versi
 }
 ```
 
-### `rcsync-config.json` (private, gitignored)
+### `rcsync-config.json` (private, portable)
 
-User-specific settings — remotes, projects, paths. Stored next to the app binary (portable) so it can sync between devices via Syncthing.
+User-specific shared settings — remotes, projects, paths, and excludes. Stored
+next to the app binary (portable) so project definitions can sync between
+devices via Syncthing. Each project has a stable `id`; keep it when renaming a
+project so its device-local automation remains attached to the same project.
 
 ```json
 {
@@ -156,6 +167,61 @@ User-specific settings — remotes, projects, paths. Stored next to the app bina
 
 Default excludes are always applied. `extra_excludes` adds your own patterns on top — both are shown in Settings, but defaults can't be removed from the UI.
 
+### Device-local automation config
+
+Schedules and the scheduled-Push queue policy are stored only on the device
+running rcsync, under the platform local application-data directory, in a file
+named `local-config-<device-id>.json`. On macOS this is normally under
+`~/Library/Application Support/rcsync`; on Windows it is normally under
+`%LOCALAPPDATA%\rcsync`. The stable device ID is kept separately in that same
+local-data directory and is not based solely on the hostname.
+
+This separation is intentional: syncing `rcsync-config.json` to a laptop does
+not turn on the same automatic Push there. If the same schedule is deliberately
+configured in both local automation files, both devices can still Push; rcsync
+does not provide a distributed cross-device lock.
+
+When rcsync deletes a local project, it also records the exact resolved remote
+target in the shared config as retired. A leftover directory discovered on
+another device remains visible for inspection, but Push, Bi-Sync, and Resync
+are blocked for that target until you explicitly reattach it. This protection
+matches the remote name and resolved remote path, not the local or project name,
+so an unrelated project with the same name is not blocked. Reattaching creates
+a new project identity and does not restore an old schedule or start a Push.
+
+A schedule runs only while rcsync is open. If the app is reopened after a due
+time, one stale Push is queued for each affected project; repeated missed
+occurrences coalesce into that one Push. The Schedule Manager defaults new
+schedules to 24 hours and provides 12-, 24-, and 48-hour one-click presets.
+With **Queue scheduled pushes** enabled, scheduled Pushes run one at a time and
+due projects wait their turn. Push remains local-authoritative and can remove
+remote-only files.
+
+Older configs may contain `schedule` inside a project or
+`queue_scheduled_pushes` at the top level. Those shared legacy values are
+disabled on load. Use **Schedules → Move here** once, on the device that should
+own them, to copy them into the local automation config and remove them from
+the shared file. Migration is explicit so opening the same synced config on a
+second device cannot silently enable its schedules.
+
+Older releases could also create a whole config named for the machine. Those
+files are not selected automatically. If one is found, open Settings and use
+**Convert here** to copy it into the canonical `rcsync-config.json`; schedules
+still require the separate **Move here** action.
+
+```json
+{
+  "id": "p_8f5e7b7d2e3a91c4",
+  "name": "my-webapp",
+  "local_path": "~/projects/my-webapp",
+  "remote_path": "proj/my-webapp"
+}
+```
+
+Use the clock icon on a project card, or press `t` with a project selected, to
+edit its schedule. The scheduler uses the same Push path, filters, empty-source
+guard, cancellation, and progress reporting as a manual Push.
+
 ### Key settings
 
 | Setting | File | Description |
@@ -166,6 +232,7 @@ Default excludes are always applied. `extra_excludes` adds your own patterns on 
 | `remotes` | rcsync-config.json | Available remotes with their base paths |
 | `scan_dirs` | rcsync-config.json | Local directories to scan for project folders |
 | `auto_check_on_launch` | rcsync-config.json | Run Check All when the app opens |
+| `queue_scheduled_pushes` | device-local automation config | Queue scheduled Pushes so only one scheduled project runs at a time; enabled by default on each device |
 | `rclone_transfers` | rcsync-config.json | Files transferred in parallel per rclone process. Omit for Automatic (rclone's own setting); 1–8 otherwise |
 
 ### Supported rclone configuration
@@ -204,6 +271,7 @@ Toggle with the **Keys** checkbox or **Cmd+K**.
 | `f` | Bi-Sync | |
 | `g` | Pull | |
 | `h` | Delete local | |
+| `t` | Schedule Push | |
 | `/` | Focus filter | |
 | `c` | Check All | |
 | `p` | Push All | |

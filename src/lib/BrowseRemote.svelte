@@ -10,7 +10,7 @@
   let loading = $state(true);
   let error = $state("");
   let search = $state("");
-  let pullingName = $state("");
+  let pullingKey = $state("");
   let pullPath = $state("");
   let showPullConfirm = $state(false);
   let pullTarget: RemoteDir | null = $state(null);
@@ -65,31 +65,34 @@
 
   async function confirmPull() {
     if (!pullTarget) return;
-    const name = pullTarget.name;
-    pullingName = name;
+    const target = pullTarget;
+    const name = target.name;
+    pullingKey = target.project_id || target.remote_path;
     showPullConfirm = false;
 
     try {
       const hasContent = await invoke<boolean>("check_local_exists", { localPath: pullPath });
       if (hasContent) {
-        alert(
+        error =
           `"${pullPath}" already has content on this device.\n\n` +
           `Pulling would overwrite local files. Local is always authoritative.\n\n` +
-          `If you really want to pull, remove or rename the local directory first.`
-        );
+          `Remove or rename the local directory first.`;
         return;
       }
 
       await invoke("pull_new_project", {
         name,
         localPath: pullPath,
+        projectId: target.project_id,
+        remote: target.remote,
+        remotePath: target.remote_path,
       });
 
       await load();
     } catch (e) {
-      alert(`Pull failed: ${e}`);
+      error = `Pull failed: ${e}`;
     } finally {
-      pullingName = "";
+      pullingKey = "";
       pullTarget = null;
     }
   }
@@ -101,6 +104,7 @@
   }
 
   function statusLabel(dir: RemoteDir): string {
+    if (dir.ambiguous) return "ambiguous configured target";
     if (dir.in_config && dir.has_local) return "configured";
     if (dir.in_config && !dir.has_local) return "configured (missing locally)";
     if (!dir.in_config && dir.has_local) return "found locally";
@@ -108,6 +112,7 @@
   }
 
   function badgeClass(dir: RemoteDir): string {
+    if (dir.ambiguous) return "warn-badge";
     if (dir.has_local) return "local-badge";
     if (dir.in_config) return "warn-badge";
     return "remote-badge";
@@ -165,7 +170,7 @@
         <div class="status">No matches for "{search}"</div>
       {:else}
         <div class="dir-list">
-          {#each filtered as dir (dir.name)}
+          {#each filtered as dir (dir.remote_path)}
             <div class="dir-row" class:local={dir.has_local} class:warn={dir.in_config && !dir.has_local}>
               <div class="dir-info">
                 <span class="dir-name">{dir.name}</span>
@@ -179,7 +184,9 @@
                   <span class="synced-label">Ready</span>
                 {:else if dir.has_local && !dir.in_config}
                   <span class="found-label">Found locally</span>
-                {:else if pullingName === dir.name}
+                {:else if dir.ambiguous}
+                  <span class="warn-label">Resolve duplicate target IDs first</span>
+                {:else if pullingKey === (dir.project_id || dir.remote_path)}
                   <span class="pulling-label">Pulling...</span>
                 {:else}
                   <button class="pull-btn" onclick={() => startPull(dir)}>

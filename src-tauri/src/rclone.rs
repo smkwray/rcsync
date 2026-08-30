@@ -1,4 +1,5 @@
-use crate::config::{self, expand_tilde, find_local_path, AppConfig, Project};
+use crate::config::{self, expand_tilde, find_scanned_local_path, AppConfig, Project};
+use serde::Deserialize;
 use shared_child::SharedChild;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -12,8 +13,9 @@ use tauri::{AppHandle, Emitter};
 /// by the frontend so a cancel reads as a cancel and not as a sync failure.
 pub const CANCELLED: &str = "CANCELLED";
 
-/// Operations in flight, all keyed by project name — the same key the UI uses
-/// for its running state, so a cancel request needs nothing but that name.
+/// Operations in flight, all keyed by immutable project ID. The display name is
+/// retained separately for logs and UI labels; a rename must not split one
+/// operation into two registry entries.
 ///
 /// A project enters `active` the moment its command starts, *before* it queues
 /// on the concurrency semaphore. That distinction is the whole point: during a
@@ -25,6 +27,9 @@ struct Ops {
     active: HashSet<String>,
     running: HashMap<String, Arc<SharedChild>>,
     cancelled: HashSet<String>,
+    modes: HashMap<String, String>,
+    scheduled: HashSet<String>,
+    names: HashMap<String, String>,
 }
 
 fn ops() -> MutexGuard<'static, Ops> {
@@ -36,40 +41,93 @@ fn ops() -> MutexGuard<'static, Ops> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Marks a project as having an operation in flight, and clears every trace of
+/// Marks a project ID as having an operation in flight, and clears every trace of
 /// it on drop — including on early-return paths. Without the drop, a cancel
 /// arriving just after an operation finished would leak onto its next run.
-pub struct OpGuard(String);
+pub struct OpGuard {
+    project_id: String,
+}
 
 impl Drop for OpGuard {
     fn drop(&mut self) {
         let mut ops = ops();
-        ops.active.remove(&self.0);
-        ops.running.remove(&self.0);
-        ops.cancelled.remove(&self.0);
+        ops.active.remove(&self.project_id);
+        ops.running.remove(&self.project_id);
+        ops.cancelled.remove(&self.project_id);
+        ops.modes.remove(&self.project_id);
+        ops.scheduled.remove(&self.project_id);
+        ops.names.remove(&self.project_id);
+        // A scheduled Push that was deferred behind this project should be
+        // retried as soon as the claim is released, not only when the next
+        // scheduler timer fires.
+        crate::scheduler::notify_config_changed();
     }
 }
 
 /// Claim a project for an operation. Fails if one is already in flight for it,
 /// which would mean two rclone processes syncing the same pair of directories.
+#[cfg(test)]
 pub fn start_op(name: &str) -> Result<OpGuard, String> {
+    start_op_with(name, name, "", false)
+}
+
+/// Claim an operation and retain enough metadata for a WebView that attaches
+/// after the operation began to reconstruct the same running state.
+pub fn start_op_with(
+    project_id: &str,
+    display_name: &str,
+    mode: &str,
+    scheduled: bool,
+) -> Result<OpGuard, String> {
     let mut ops = ops();
-    if !ops.active.insert(name.to_string()) {
-        return Err(format!("An operation is already running for '{}'", name));
+    if !ops.active.insert(project_id.to_string()) {
+        return Err(format!(
+            "An operation is already running for '{}'",
+            display_name
+        ));
     }
-    Ok(OpGuard(name.to_string()))
+    ops.modes.insert(project_id.to_string(), mode.to_string());
+    ops.names
+        .insert(project_id.to_string(), display_name.to_string());
+    if scheduled {
+        ops.scheduled.insert(project_id.to_string());
+    }
+    Ok(OpGuard {
+        project_id: project_id.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationSnapshot {
+    pub project_id: String,
+    pub project: String,
+    pub mode: String,
+    pub scheduled: bool,
+}
+
+pub fn active_operations() -> Vec<OperationSnapshot> {
+    let ops = ops();
+    ops.active
+        .iter()
+        .map(|project_id| OperationSnapshot {
+            project_id: project_id.clone(),
+            project: ops.names.get(project_id).cloned().unwrap_or_default(),
+            mode: ops.modes.get(project_id).cloned().unwrap_or_default(),
+            scheduled: ops.scheduled.contains(project_id),
+        })
+        .collect()
 }
 
 /// Stop before doing any work if a cancel landed while this operation was
 /// queued. Call after acquiring a concurrency permit.
-pub fn check_cancelled(name: &str) -> Result<(), String> {
-    if ops().cancelled.contains(name) {
+pub fn check_cancelled(project_id: &str) -> Result<(), String> {
+    if ops().cancelled.contains(project_id) {
         return Err(CANCELLED.to_string());
     }
     Ok(())
 }
 
-/// Ask the operation on `name` to stop, killing rclone if it has started.
+/// Ask the operation on an immutable project ID to stop, killing rclone if it has started.
 /// Returns false when nothing was in flight for that project.
 ///
 /// This is currently `SharedChild::kill` (SIGKILL / TerminateProcess), which is
@@ -80,15 +138,15 @@ pub fn check_cancelled(name: &str) -> Result<(), String> {
 /// saving state, and its `--recover` / `--resilient` flags are meant to avoid the
 /// forced `--resync` that an abrupt kill leaves behind. Revisit before relying on
 /// cancel mid-bisync.
-pub fn request_cancel(name: &str) -> bool {
+pub fn request_cancel(project_id: &str) -> bool {
     let mut ops = ops();
-    if !ops.active.contains(name) {
+    if !ops.active.contains(project_id) {
         return false;
     }
-    ops.cancelled.insert(name.to_string());
+    ops.cancelled.insert(project_id.to_string());
     // No child yet means the operation is still queued; `check_cancelled` will
     // stop it before it ever spawns.
-    let child = ops.running.get(name).cloned();
+    let child = ops.running.get(project_id).cloned();
     drop(ops);
     if let Some(child) = child {
         let _ = child.kill();
@@ -106,12 +164,14 @@ pub fn set_app_handle(handle: AppHandle) {
 
 #[derive(Clone, serde::Serialize)]
 struct LogEvent {
+    project_id: String,
     project: String,
     lines: Vec<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct ProgressEvent {
+    project_id: String,
     project: String,
     text: String,
 }
@@ -152,7 +212,11 @@ fn render_log_line(raw: &str) -> (LogLine, bool) {
         return (LogLine::Progress(format_progress(stats)), false);
     }
 
-    let msg = record.get("msg").and_then(|m| m.as_str()).unwrap_or("").trim();
+    let msg = record
+        .get("msg")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim();
     // Classified here, where the structured message is still separate from the
     // object it concerns.
     let pre_apply_stop = PRE_APPLY_STOPS.iter().any(|m| msg.contains(m));
@@ -180,7 +244,12 @@ fn render_log_line(raw: &str) -> (LogLine, bool) {
 /// checked, and a transfer reports what it has moved, without either padding
 /// the line with the other's zeroes.
 fn format_progress(stats: &serde_json::Value) -> String {
-    let num = |k: &str| stats.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let num = |k: &str| {
+        stats
+            .get(k)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
     let mut parts: Vec<String> = Vec::new();
 
     // Every total here counts only what rclone's listing has found SO FAR, and
@@ -197,7 +266,11 @@ fn format_progress(stats: &serde_json::Value) -> String {
 
     let (bytes, total_bytes) = (num("bytes"), num("totalBytes"));
     if total_bytes > 0.0 {
-        parts.push(format!("{} / {}", human_bytes(bytes), human_bytes(total_bytes)));
+        parts.push(format!(
+            "{} / {}",
+            human_bytes(bytes),
+            human_bytes(total_bytes)
+        ));
         if !caught_up_with_discovery {
             parts.push(format!("{:.0}%", bytes / total_bytes * 100.0));
         }
@@ -212,7 +285,10 @@ fn format_progress(stats: &serde_json::Value) -> String {
         }
     }
     if total_transfers > 0.0 {
-        parts.push(format!("{} / {} files", transfers as i64, total_transfers as i64));
+        parts.push(format!(
+            "{} / {} files",
+            transfers as i64, total_transfers as i64
+        ));
     }
     if caught_up_with_discovery {
         let listed = num("listed") as i64;
@@ -223,11 +299,19 @@ fn format_progress(stats: &serde_json::Value) -> String {
         });
     }
     if num("totalChecks") > 0.0 {
-        parts.push(format!("{} / {} checked", num("checks") as i64, num("totalChecks") as i64));
+        parts.push(format!(
+            "{} / {} checked",
+            num("checks") as i64,
+            num("totalChecks") as i64
+        ));
     }
     let errors = num("errors") as i64;
     if errors > 0 {
-        parts.push(format!("{} error{}", errors, if errors == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} error{}",
+            errors,
+            if errors == 1 { "" } else { "s" }
+        ));
     }
     // Before rclone finishes its first listing every total is still zero, and on
     // a large remote that phase runs for minutes — long enough that an elapsed
@@ -282,6 +366,7 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// immediately — only bursts coalesce — so the log stays live at low rates and
 /// stays cheap at high ones.
 struct LiveLog {
+    project_id: String,
     project: String,
     pending: Vec<String>,
     last_flush: Instant,
@@ -296,8 +381,9 @@ struct LiveLog {
 }
 
 impl LiveLog {
-    fn new(project: &str) -> Self {
+    fn new(project_id: &str, project: &str) -> Self {
         Self {
+            project_id: project_id.to_string(),
             project: project.to_string(),
             pending: Vec::new(),
             last_flush: Instant::now(),
@@ -325,7 +411,11 @@ impl LiveLog {
         if let Some(app) = APP.get() {
             let _ = app.emit(
                 "rclone-log",
-                LogEvent { project: self.project.clone(), lines },
+                LogEvent {
+                    project_id: self.project_id.clone(),
+                    project: self.project.clone(),
+                    lines,
+                },
             );
         }
         self.last_flush = Instant::now();
@@ -340,7 +430,11 @@ impl LiveLog {
         if let Some(app) = APP.get() {
             let _ = app.emit(
                 "rclone-progress",
-                ProgressEvent { project: self.project.clone(), text: text.to_string() },
+                ProgressEvent {
+                    project_id: self.project_id.clone(),
+                    project: self.project.clone(),
+                    text: text.to_string(),
+                },
             );
         }
     }
@@ -363,8 +457,12 @@ struct StderrRouter {
 }
 
 impl StderrRouter {
-    fn new(project: &str) -> Self {
-        Self { live: LiveLog::new(project), text: String::new(), pre_apply_stop: false }
+    fn new(project_id: &str, project: &str) -> Self {
+        Self {
+            live: LiveLog::new(project_id, project),
+            text: String::new(),
+            pre_apply_stop: false,
+        }
     }
 
     fn line(&mut self, raw: &str) {
@@ -419,6 +517,22 @@ pub struct RemoteDir {
     pub has_local: bool,
     pub local_path: Option<String>,
     pub in_config: bool,
+    pub ambiguous: bool,
+    /// Present only when this remote/path identifies exactly one configured
+    /// project. A display name alone is never enough to select a project.
+    pub project_id: Option<String>,
+    pub remote: String,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RcloneDirectoryEntry {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Path")]
+    path: Option<String>,
+    #[serde(rename = "IsDir")]
+    is_dir: bool,
 }
 
 /// The one authority for which patterns are in force: global defaults plus this
@@ -542,16 +656,18 @@ fn parse_rclone_size_count(output: &str) -> Result<i64, String> {
         .find(|l| l.trim_start().starts_with('{'))
         .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .and_then(|v| v.get("count").and_then(serde_json::Value::as_i64))
-        .ok_or_else(|| format!("Could not read a file count from rclone size output:\n{}", output))
+        .ok_or_else(|| {
+            format!(
+                "Could not read a file count from rclone size output:\n{}",
+                output
+            )
+        })
 }
 
 fn check_local_path(project: &Project) -> Result<String, String> {
     let local = expand_tilde(&project.local_path);
     if !Path::new(&local).exists() {
-        return Err(format!(
-            "Local path does not exist: {}",
-            local
-        ));
+        return Err(format!("Local path does not exist: {}", local));
     }
     Ok(local)
 }
@@ -601,10 +717,7 @@ fn resolve_rclone(cfg: &AppConfig) -> String {
 
     #[cfg(target_os = "linux")]
     {
-        for candidate in &[
-            "/usr/local/bin/rclone",
-            "/usr/bin/rclone",
-        ] {
+        for candidate in &["/usr/local/bin/rclone", "/usr/bin/rclone"] {
             if Path::new(candidate).exists() {
                 return candidate.to_string();
             }
@@ -654,9 +767,8 @@ fn drain<R: Read>(
     Ok(())
 }
 
-/// Run rclone and return combined stdout+stderr as a string. `key` is the
-/// project name the operation is registered under, which is how a cancel
-/// request finds this process.
+/// Run rclone and return combined stdout+stderr as a string. `project_id` is
+/// the immutable operation key; `display_name` is used only for logs.
 /// What a completed rclone run produced. `pre_apply_stop` is set only from a
 /// structured `msg`, so a caller cannot accidentally re-derive it by searching
 /// the human text — which is how an object-specific record could be mistaken
@@ -668,7 +780,12 @@ struct RcloneRun {
     pre_apply_stop: bool,
 }
 
-fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<RcloneRun, String> {
+fn run_rclone(
+    cfg: &AppConfig,
+    project_id: &str,
+    display_name: &str,
+    args: &[String],
+) -> Result<RcloneRun, String> {
     let rclone = resolve_rclone(cfg);
     let mut cmd = rclone_command(&rclone);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -700,9 +817,10 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<RcloneRun, 
     });
     let err_reader = std::thread::spawn({
         let stderr = child.take_stderr();
-        let key = key.to_string();
+        let project_id = project_id.to_string();
+        let display_name = display_name.to_string();
         move || -> Result<(String, bool), String> {
-            let mut router = StderrRouter::new(&key);
+            let mut router = StderrRouter::new(&project_id, &display_name);
             let read = drain(stderr, "stderr", &mut |raw| router.line(raw));
             // Finish either way: a read that failed partway still produced lines
             // the user should see.
@@ -717,15 +835,15 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<RcloneRun, 
     // the child we just published — no ordering slips between the two.
     let cancelled_while_spawning = {
         let mut ops = ops();
-        ops.running.insert(key.to_string(), child.clone());
-        ops.cancelled.contains(key)
+        ops.running.insert(project_id.to_string(), child.clone());
+        ops.cancelled.contains(project_id)
     };
     if cancelled_while_spawning {
         let _ = child.kill();
     }
 
     let status = child.wait();
-    ops().running.remove(key);
+    ops().running.remove(project_id);
 
     // Join both before deciding anything, so neither thread is left detached.
     let stdout = out_reader
@@ -738,7 +856,7 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<RcloneRun, 
     // A killed rclone exits on a signal and its output ends mid-transfer. Report
     // the cancel the user asked for instead of the failure it resembles. This
     // precedes the pipe checks because a cancel explains them.
-    if ops().cancelled.contains(key) {
+    if ops().cancelled.contains(project_id) {
         return Err(CANCELLED.to_string());
     }
 
@@ -762,11 +880,18 @@ fn run_rclone(cfg: &AppConfig, key: &str, args: &[String]) -> Result<RcloneRun, 
     let code = match status.code() {
         Some(c) => c,
         None => {
-            result.push_str(&format!("rclone did not exit on its own — {}\n", signal_note(&status)));
+            result.push_str(&format!(
+                "rclone did not exit on its own — {}\n",
+                signal_note(&status)
+            ));
             -1
         }
     };
-    Ok(RcloneRun { output: result, code, pre_apply_stop })
+    Ok(RcloneRun {
+        output: result,
+        code,
+        pre_apply_stop,
+    })
 }
 
 #[cfg(unix)]
@@ -842,7 +967,7 @@ fn rclone_source_file_count(
 ) -> Result<i64, String> {
     let args = probe_argv(cfg, project, local)?;
 
-    let run = run_rclone(cfg, &project.name, &args)?;
+    let run = run_rclone(cfg, &project.id, &project.name, &args)?;
     if run.code != 0 {
         return Err(format!(
             "Could not check whether '{}' has anything to sync (rclone size exited {}):\n{}",
@@ -919,13 +1044,14 @@ pub fn sync_project(
     };
     let remote = cfg.remote_path_for_project(project);
 
-    if mode == "push" {
+    if mode == "push" && !dry_run {
+        cfg.ensure_remote_target_writable(project)?;
         ensure_source_not_empty(cfg, project, &local, "push")?;
     }
 
     let args = sync_argv(cfg, project, mode, &local, &remote, dry_run)?;
 
-    let run = run_rclone(cfg, &project.name, &args)?;
+    let run = run_rclone(cfg, &project.id, &project.name, &args)?;
     if run.code == 0 {
         Ok(run.output)
     } else {
@@ -958,13 +1084,9 @@ fn render_filters_file(cfg: &AppConfig, project: &Project) -> Result<String, Str
 /// `<file>.md5` and treats that path as the identity of the protected filter
 /// history — a path that moved would defeat the check it exists for.
 ///
-/// Collision-resistant for the same reason. A readable prefix alone is not
-/// enough: sanitising every awkward character to `_` maps `a.b`, `a b` and
-/// `a_b` onto one filename, so two projects would share both the filter file
-/// and rclone's hash sidecar. They would lock each other out, and because three
-/// operations can run at once, one could rewrite the file between another's
-/// argv construction and rclone reading it. The digest of the full name keeps
-/// distinct projects distinct while the prefix keeps the directory legible.
+/// The filename is derived from the immutable project ID, not its display name.
+/// This keeps equal-name projects separate and keeps a project's protected
+/// history stable when the user renames it.
 fn filters_dir() -> Result<std::path::PathBuf, String> {
     // Unit tests exercise the real argv builder, which writes the filters file.
     // Never let that overwrite a user's live bisync identity or force their next
@@ -976,7 +1098,11 @@ fn filters_dir() -> Result<std::path::PathBuf, String> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::thread::current().id().hash(&mut hasher);
         Ok(std::env::temp_dir()
-            .join(format!("rcsync-test-{}-{}", std::process::id(), hasher.finish()))
+            .join(format!(
+                "rcsync-test-{}-{}",
+                std::process::id(),
+                hasher.finish()
+            ))
             .join("bisync-filters"))
     }
     #[cfg(not(test))]
@@ -990,21 +1116,46 @@ fn filters_dir() -> Result<std::path::PathBuf, String> {
 
 fn filters_file_path(project: &Project) -> Result<std::path::PathBuf, String> {
     let dir = filters_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {}", dir.display(), e))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create {}: {}", dir.display(), e))?;
 
+    Ok(dir.join(format!(
+        "project-{:016x}.filter",
+        identity_digest(&project.id)
+    )))
+}
+
+/// FNV-1a (64-bit) over an immutable project ID. Not cryptographic — it only
+/// has to make the already-opaque ID safe and compact as a filename, and it
+/// must not pull in a dependency to do it.
+fn identity_digest(project_id: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in project_id.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The pre-ID filename format. It is retained only so ordinary Bi-Sync can
+/// detect an old history and fail closed; without durable ownership metadata,
+/// a name is not enough to decide which project may inherit it.
+fn legacy_filters_file_path(project: &Project) -> Result<std::path::PathBuf, String> {
+    let dir = filters_dir()?;
     let prefix: String = project
         .name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(40)
         .collect();
-    Ok(dir.join(format!("{}-{:016x}.filter", prefix, name_digest(&project.name))))
+    Ok(dir.join(format!(
+        "{}-{:016x}.filter",
+        prefix,
+        legacy_name_digest(&project.name)
+    )))
 }
 
-/// FNV-1a (64-bit) over the project name. Not cryptographic — it only has to separate
-/// names that the readable prefix collapses together, and it must not pull in a
-/// dependency to do it.
-fn name_digest(name: &str) -> u64 {
+fn legacy_name_digest(name: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in name.as_bytes() {
         hash ^= *byte as u64;
@@ -1013,23 +1164,47 @@ fn name_digest(name: &str) -> u64 {
     hash
 }
 
+#[cfg(test)]
+fn filters_sidecar(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.md5", path.display()))
+}
+
+fn reject_legacy_filters_without_provenance(
+    project: &Project,
+    destination: &Path,
+) -> Result<(), String> {
+    if destination.exists() {
+        return Ok(());
+    }
+    let legacy = legacy_filters_file_path(project)?;
+    if !legacy.exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "Bi-Sync history for '{}' uses a legacy name-based path and cannot be assigned automatically; run an explicit per-project resync",
+        project.name
+    ))
+}
+
 /// Write the filters file for a project and return its path.
 ///
 /// Atomic, because rclone hashes what it reads: a torn write would either fail
 /// the run or, worse, establish a hash for a filter set that was never complete.
-fn write_filters_file(cfg: &AppConfig, project: &Project) -> Result<String, String> {
+fn write_filters_file(
+    cfg: &AppConfig,
+    project: &Project,
+    reject_legacy_history: bool,
+) -> Result<String, String> {
     let path = filters_file_path(project)?;
+    if reject_legacy_history {
+        reject_legacy_filters_without_provenance(project, &path)?;
+    }
     let body = render_filters_file(cfg, project)?;
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&tmp, &body).map_err(|e| format!("Could not write {}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("Could not replace {}: {}", path.display(), e))?;
+    // Use the shared atomic replacement helper. On Windows, rename-over-
+    // existing is not permitted, so a hand-rolled temp+rename succeeds once
+    // and fails on the second ordinary Bi-Sync for the same project.
+    crate::config::atomic_write(&path, body.as_bytes())
+        .map_err(|error| format!("Could not replace {}: {}", path.display(), error))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1062,7 +1237,10 @@ fn bisync_argv(
     // cover — where the two sides record one file under different names, so a
     // pattern hides it from one listing only. There the deltas do not cancel,
     // and rclone's own protection is the remedy rather than a second one here.
-    let filters = write_filters_file(cfg, project)?;
+    // An explicit resync is the documented escape hatch for an ambiguous
+    // legacy name-based history. It starts fresh at the immutable-ID path;
+    // ordinary bi-sync must refuse instead of silently choosing a sidecar.
+    let filters = write_filters_file(cfg, project, !resync)?;
     let mut args = vec!["bisync".to_string(), local.to_string(), remote.to_string()];
     args.push("--filters-file".to_string());
     args.push(filters);
@@ -1104,13 +1282,13 @@ fn bisync_failure(code: i32, output: &str, pre_apply_stop: bool) -> String {
     message
 }
 
-
 /// `resync` rebuilds bisync's stored listings from scratch and is the only way
 /// past rclone's filters-file refusal. It is a separate entry point on purpose:
 /// it must never be reachable from the ordinary Bi-Sync button, and rclone's
 /// default resync resolves by giving Path1 (local) precedence, so it can
 /// overwrite the remote side.
 pub fn bisync_project(cfg: &AppConfig, project: &Project, resync: bool) -> Result<String, String> {
+    cfg.ensure_remote_target_writable(project)?;
     let local = check_local_path(project)?;
 
     ensure_source_not_empty(cfg, project, &local, "bi-sync")?;
@@ -1118,7 +1296,7 @@ pub fn bisync_project(cfg: &AppConfig, project: &Project, resync: bool) -> Resul
     let remote = cfg.remote_path_for_project(project);
     let args = bisync_argv(cfg, project, &local, &remote, resync)?;
 
-    let run = run_rclone(cfg, &project.name, &args)?;
+    let run = run_rclone(cfg, &project.id, &project.name, &args)?;
     if run.code == 0 {
         Ok(run.output)
     } else {
@@ -1157,7 +1335,7 @@ pub fn check_project(cfg: &AppConfig, project: &Project) -> Result<CheckOutcome,
 
     let args = check_argv(cfg, project, &local, &remote)?;
 
-    let run = run_rclone(cfg, &project.name, &args)?;
+    let run = run_rclone(cfg, &project.id, &project.name, &args)?;
     parse_check_output(&run.output, run.code)
 }
 
@@ -1185,7 +1363,10 @@ fn parse_check_output(raw: &str, code: i32) -> Result<CheckOutcome, String> {
         }
         let (marker, rest) = line.split_at(2);
         let label = match marker {
-            "= " => { matches += 1; continue }
+            "= " => {
+                matches += 1;
+                continue;
+            }
             "* " => "CHANGED",
             // rclone's `--combined` markers are relative to source and
             // destination, and `check_argv` passes local as the source: `+` is
@@ -1197,7 +1378,10 @@ fn parse_check_output(raw: &str, code: i32) -> Result<CheckOutcome, String> {
             "- " => "REMOTE ONLY",
             // rclone could not read the file on one side; it has no verdict for
             // it, so neither do we.
-            "! " => { unreadable += 1; "UNREADABLE" }
+            "! " => {
+                unreadable += 1;
+                "UNREADABLE"
+            }
             // Everything else on this stream is rclone's own log, which now
             // reaches the user live and in full. Copying its notices into the
             // verdict as well printed each one twice, and did it by fishing for
@@ -1233,45 +1417,127 @@ fn parse_check_output(raw: &str, code: i32) -> Result<CheckOutcome, String> {
         format!("{} differences, {} matching.\n", differences, matches)
     });
 
-    Ok(CheckOutcome { synced: differences == 0, differences, matches, details })
+    Ok(CheckOutcome {
+        synced: differences == 0,
+        differences,
+        matches,
+        details,
+    })
 }
 
 /// List remote projects. If `remote_name` is provided, use that remote; otherwise use active.
 pub fn list_remote(cfg: &AppConfig, remote_name: Option<&str>) -> Result<Vec<RemoteDir>, String> {
     let rclone = resolve_rclone(cfg);
     let rc = if let Some(name) = remote_name {
-        cfg.remotes.iter().find(|r| r.name == name).cloned()
-            .unwrap_or(config::RemoteConfig { name: name.to_string(), base_path: "proj".into() })
+        cfg.remotes
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .unwrap_or(config::RemoteConfig {
+                name: name.to_string(),
+                base_path: "proj".into(),
+            })
     } else {
         cfg.active_remote()
     };
+    // `lsd` is for humans: its columns are whitespace-delimited, so parsing its
+    // last field turns "My Project" into "Project". `lsjson` gives us the exact
+    // directory name/path that must be carried into Browse Pull's identity
+    // resolver. It is intentionally non-recursive, matching the old `lsd`
+    // behavior of listing only immediate project directories.
+    let list_target = format!(
+        "{}:{}",
+        rc.name,
+        config::AppConfig::canonical_remote_path(&rc.base_path)
+    );
     let output = rclone_command(&rclone)
-        .args(["lsd", &format!("{}:{}", rc.name, rc.base_path)])
+        .args([
+            "lsjson",
+            &list_target,
+            "--dirs-only",
+            "--no-modtime",
+            "--no-mimetype",
+        ])
         .output()
-        .map_err(|e| format!("Failed to run rclone lsd: {e}"))?;
+        .map_err(|e| format!("Failed to run rclone lsjson: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("rclone lsd failed: {stderr}"));
+        return Err(format!("rclone lsjson failed: {stderr}"));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let config_names: std::collections::HashSet<&str> =
-        cfg.projects.iter().map(|p| p.name.as_str()).collect();
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| format!("rclone lsjson returned non-UTF-8 output: {e}"))?;
+    let entries: Vec<RcloneDirectoryEntry> = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Could not parse rclone lsjson output: {e}"))?;
+    let mut seen_paths = HashSet::new();
+    let mut result = Vec::with_capacity(entries.len());
 
-    Ok(stdout
-        .lines()
-        .filter_map(|line| {
-            let name = line.split_whitespace().last()?;
-            let local_path = find_local_path(cfg, name);
-            Some(RemoteDir {
-                name: name.to_string(),
-                has_local: local_path.is_some(),
-                local_path,
-                in_config: config_names.contains(name),
+    for entry in entries {
+        if !entry.is_dir {
+            return Err("rclone lsjson returned a non-directory with --dirs-only".into());
+        }
+        let name = entry
+            .name
+            .ok_or("rclone lsjson returned a directory without a name")?;
+        let path = entry
+            .path
+            .ok_or("rclone lsjson returned a directory without a path")?;
+        if name.is_empty() || path.is_empty() || name != path {
+            return Err(format!(
+                "rclone lsjson returned an unexpected directory path/name pair: {:?} / {:?}",
+                name, path
+            ));
+        }
+        // Without --recursive, Path and Name are the same immediate child.
+        // Reject separators and absolute-looking values rather than silently
+        // re-rooting a malformed listing into a different remote target.
+        if name.starts_with('/') || name.contains('/') || name == "." || name == ".." {
+            return Err(format!(
+                "rclone lsjson returned an unexpected nested directory name: {name:?}"
+            ));
+        }
+        let remote_path = config::AppConfig::join_remote_child_path(&rc.base_path, &name);
+        if !seen_paths.insert(remote_path.clone()) {
+            return Err(format!(
+                "rclone lsjson returned duplicate directory path: {remote_path}"
+            ));
+        }
+        let matching: Vec<&Project> = cfg
+            .projects
+            .iter()
+            .filter(|project| {
+                cfg.project_remote(project).name == rc.name
+                    && cfg.project_remote_path(project) == remote_path
             })
-        })
-        .collect())
+            .collect();
+        let local_path = match matching.as_slice() {
+            [project] => {
+                let expanded = config::expand_tilde(&project.local_path);
+                if Path::new(&expanded).exists() {
+                    Some(project.local_path.clone())
+                } else {
+                    None
+                }
+            }
+            [] => find_scanned_local_path(cfg, &name),
+            _ => None,
+        };
+        result.push(RemoteDir {
+            name,
+            has_local: local_path.is_some(),
+            local_path,
+            in_config: !matching.is_empty(),
+            ambiguous: matching.len() > 1,
+            project_id: matching
+                .first()
+                .and_then(|_| (matching.len() == 1).then(|| matching[0].id.clone())),
+            remote: rc.name.clone(),
+            remote_path,
+        });
+    }
+
+    Ok(result)
 }
 
 /// OS-generated files worth ignoring when deciding whether a directory a user is
@@ -1279,10 +1545,7 @@ pub fn list_remote(cfg: &AppConfig, remote_name: Option<&str>) -> Result<Vec<Rem
 /// by default — the shipped `defaults.json` excludes them explicitly. This is no
 /// longer part of the destructive-push guard, which asks rclone directly.
 fn is_os_junk(name: &str) -> bool {
-    name == ".DS_Store"
-        || name == "Thumbs.db"
-        || name == "desktop.ini"
-        || name.starts_with("._")
+    name == ".DS_Store" || name == "Thumbs.db" || name == "desktop.ini" || name.starts_with("._")
 }
 
 pub fn local_dir_has_content(path: &str) -> bool {
@@ -1312,7 +1575,10 @@ mod cancel_tests {
         // only killed live children, every queued project would start anyway.
         let name = "test-queued";
         let _op = start_op(name).unwrap();
-        assert!(request_cancel(name), "an in-flight operation should accept a cancel");
+        assert!(
+            request_cancel(name),
+            "an in-flight operation should accept a cancel"
+        );
         assert!(
             check_cancelled(name).is_err(),
             "an operation cancelled while queued must refuse to start rclone"
@@ -1346,7 +1612,10 @@ mod cancel_tests {
             request_cancel(name);
         }
         let _op = start_op(name).unwrap();
-        assert!(check_cancelled(name).is_ok(), "a fresh operation must start clean");
+        assert!(
+            check_cancelled(name).is_ok(),
+            "a fresh operation must start clean"
+        );
     }
 
     #[test]
@@ -1391,7 +1660,7 @@ mod cancel_tests {
             }
         });
 
-        let err = run_rclone(&cfg, name, &args).unwrap_err();
+        let err = run_rclone(&cfg, name, name, &args).unwrap_err();
         assert_eq!(err, CANCELLED, "a killed process must report as cancelled");
     }
 
@@ -1404,12 +1673,52 @@ mod cancel_tests {
             "two rclone runs over the same directory pair must never overlap"
         );
     }
+
+    /// The scheduled path claims an immutable ID under the old display name,
+    /// then the resolved Project can carry a new display name after a reload.
+    /// The child must still be registered and cancellable under that same ID,
+    /// and a second claim must remain impossible.
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_operation_keeps_claim_and_cancellation_by_id_across_rename() {
+        let project_id = format!("test-rename-id-{}", std::process::id());
+        let old_name = "old-name";
+        let new_name = "new-name";
+        let _op = start_op_with(&project_id, old_name, "push", true).unwrap();
+        assert!(
+            start_op_with(&project_id, new_name, "push", false).is_err(),
+            "a rename must not permit a second operation for the same project ID"
+        );
+
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = "/bin/sh".into();
+        let args = vec!["-c".to_string(), "sleep 30".to_string()];
+        let cancel_id = project_id.clone();
+        std::thread::spawn(move || loop {
+            if ops().running.contains_key(&cancel_id) {
+                assert!(request_cancel(&cancel_id));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        });
+
+        let err = run_rclone(&cfg, &project_id, new_name, &args).unwrap_err();
+        assert_eq!(err, CANCELLED);
+        assert!(
+            active_operations().iter().any(|operation| {
+                operation.project_id == project_id
+                    && operation.project == old_name
+                    && operation.scheduled
+            }),
+            "the original claim remains identifiable by ID until its guard drops"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, RemoteConfig};
+    use crate::config::{AppConfig, RemoteConfig, RetiredTarget};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1428,11 +1737,7 @@ mod tests {
     }
 
     fn tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
-        fn visit(
-            root: &std::path::Path,
-            dir: &std::path::Path,
-            out: &mut Vec<(PathBuf, Vec<u8>)>,
-        ) {
+        fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
             let mut entries: Vec<_> = fs::read_dir(dir)
                 .unwrap()
                 .map(|entry| entry.unwrap())
@@ -1469,21 +1774,182 @@ mod tests {
             default_excludes: vec![],
             extra_excludes: vec![],
             projects: vec![],
+            retired_targets: vec![],
+            retired_targets_unreadable: false,
             scan_dirs: vec![],
             default_pull_dir: String::new(),
             auto_check_on_launch: false,
+            queue_scheduled_pushes: true,
+            legacy_schedule_count: 0,
+            legacy_queue_policy: false,
+            legacy_host_config_available: false,
+            legacy_queue_scheduled_pushes: None,
             rclone_transfers: None,
+            config_warnings: vec![],
         }
     }
 
     fn project_with(excludes: Vec<&str>) -> Project {
         Project {
+            id: String::new(),
             name: "size-probe-test".into(),
             local_path: String::new(),
             remote_path: String::new(),
             remote: "gdrive".into(),
             excludes: excludes.into_iter().map(str::to_string).collect(),
+            schedule: None,
+            schedule_error: None,
+            legacy_schedule: None,
+            legacy_schedule_raw: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browse_remote_preserves_exact_directory_names() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("browse-json-names");
+        let fake = dir.join("fake-rclone");
+        fs::write(
+            &fake,
+            r##"#!/bin/sh
+if [ "$1" = "lsjson" ]; then
+  printf '%s' '[{"Name":"Project","Path":"Project","IsDir":true},{"Name":"Project ","Path":"Project ","IsDir":true},{"Name":"My Project","Path":"My Project","IsDir":true}]'
+  exit 0
+fi
+printf 'unexpected command: %s\n' "$1" >&2
+exit 97
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fake, permissions).unwrap();
+
+        let mut cfg = test_cfg(vec![]);
+        cfg.rclone_path = fake.to_string_lossy().into_owned();
+        let mut renamed = project_with(vec![]);
+        renamed.id = "p-renamed".into();
+        renamed.name = "old-label".into();
+        renamed.remote_path = "proj/My Project".into();
+        cfg.projects.push(renamed);
+
+        let listed = list_remote(&cfg, None).expect("structured directory listing should parse");
+        let spaced = listed
+            .iter()
+            .find(|entry| entry.name == "My Project")
+            .expect("the exact whitespace-bearing directory must remain present");
+        assert_eq!(spaced.remote_path, "proj/My Project");
+        assert_eq!(spaced.project_id.as_deref(), Some("p-renamed"));
+        assert!(spaced.in_config);
+
+        let plain = listed
+            .iter()
+            .find(|entry| entry.name == "Project")
+            .expect("the plain directory must remain present");
+        assert_eq!(plain.remote_path, "proj/Project");
+        assert!(!plain.in_config);
+
+        let trailing = listed
+            .iter()
+            .find(|entry| entry.name == "Project ")
+            .expect("a trailing-space directory must remain distinct");
+        assert_eq!(trailing.remote_path, "proj/Project ");
+        assert!(!trailing.in_config);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browse_remote_and_pull_use_the_same_slash_canonical_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("browse-slash-authority");
+        let list_log = dir.join("list-target");
+        let sync_log = dir.join("sync-source");
+        let fake = dir.join("fake-rclone");
+        let script = format!(
+            r#"#!/bin/sh
+case "$1" in
+  lsjson)
+    printf '%s' '[{{"Name":"Project","Path":"Project","IsDir":true}}]'
+    printf '%s' "$2" > "{}"
+    ;;
+  sync)
+    printf '%s' "$2" > "{}"
+    ;;
+  *) exit 97 ;;
+esac
+"#,
+            list_log.display(),
+            sync_log.display()
+        );
+        fs::write(&fake, script).unwrap();
+        let mut permissions = fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fake, permissions).unwrap();
+
+        for (index, base) in ["", "/", "proj", "proj/"].iter().enumerate() {
+            let mut cfg = test_cfg(vec![]);
+            cfg.rclone_path = fake.to_string_lossy().into_owned();
+            cfg.remotes[0].base_path = (*base).into();
+            let mut project = project_with(vec![]);
+            project.id = format!("p-slash-{index}");
+            project.name = "Project".into();
+            project.local_path = dir.join(format!("local-{index}")).to_string_lossy().into();
+            cfg.projects.push(project.clone());
+
+            let expected_base = AppConfig::canonical_remote_path(base);
+            let expected_project = AppConfig::join_remote_child_path(base, "Project");
+            let listed = list_remote(&cfg, None).unwrap();
+            assert_eq!(listed[0].remote_path, expected_project);
+            assert_eq!(
+                fs::read_to_string(&list_log).unwrap(),
+                format!("gdrive:{expected_base}")
+            );
+
+            sync_project(&cfg, &project, "pull", false).unwrap();
+            assert_eq!(
+                fs::read_to_string(&sync_log).unwrap(),
+                format!("gdrive:{expected_project}")
+            );
+        }
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_retired_target_is_refused_before_push_invokes_rclone() {
+        let dir = temp_dir("retired-target-guard");
+        fs::write(dir.join("stale.txt"), "stale").unwrap();
+        let mut cfg = test_cfg(vec![]);
+        cfg.retired_targets.push(RetiredTarget {
+            remote: "gdrive".into(),
+            remote_path: "proj/example".into(),
+            name_at_retirement: "example".into(),
+            project_id_at_retirement: "p_old".into(),
+            retired_at_ms: 1,
+            retired_by_device: "device-a".into(),
+        });
+        let project = Project {
+            id: "p_discovered".into(),
+            name: "example".into(),
+            local_path: dir.to_string_lossy().into_owned(),
+            remote_path: String::new(),
+            remote: "gdrive".into(),
+            excludes: Vec::new(),
+            schedule: None,
+            schedule_error: None,
+            legacy_schedule: None,
+            legacy_schedule_raw: None,
+        };
+
+        let error = sync_project(&cfg, &project, "push", false)
+            .expect_err("a retired remote target must be blocked");
+        assert!(error.contains("Remote target gdrive:proj/example was retired"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// The counterexample that forced this rewrite. `node_modules/**` is a
@@ -1523,7 +1989,11 @@ mod tests {
         let count = rclone_source_file_count(&cfg, &project_with(vec![]), dir.to_str().unwrap());
 
         fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(count.unwrap(), 1, "a normal source file must keep the push allowed");
+        assert_eq!(
+            count.unwrap(),
+            1,
+            "a normal source file must keep the push allowed"
+        );
     }
 
     /// Per-project excludes must reach the probe too, or a project that excludes
@@ -1544,8 +2014,16 @@ mod tests {
             rclone_source_file_count(&cfg, &project_with(vec![]), dir.to_str().unwrap());
 
         fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(with_exclude.unwrap(), 0, "the project exclude must empty this source");
-        assert_eq!(without_exclude.unwrap(), 1, "without it the source has real content");
+        assert_eq!(
+            with_exclude.unwrap(),
+            0,
+            "the project exclude must empty this source"
+        );
+        assert_eq!(
+            without_exclude.unwrap(),
+            1,
+            "without it the source has real content"
+        );
     }
 
     // --- live output: rclone's log has to reach the user while it is running ---
@@ -1602,7 +2080,10 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 3, "got {:?}", seen);
-        assert_eq!(seen[0], "first", "a CRLF line must not carry \\r into the log");
+        assert_eq!(
+            seen[0], "first",
+            "a CRLF line must not carry \\r into the log"
+        );
         assert!(
             seen[1].starts_with("second ") && seen[1].ends_with(" name"),
             "one undecodable byte must not cost the rest of the line: {:?}",
@@ -1628,7 +2109,10 @@ mod tests {
         let output: String = (1..=500).map(|i| format!("line {}\n", i)).collect();
         let msg = failure_message(1, &output);
 
-        assert!(msg.contains("line 500"), "the last line is the reason and must survive");
+        assert!(
+            msg.contains("line 500"),
+            "the last line is the reason and must survive"
+        );
         assert!(!msg.contains("line 1\n"), "the head must not be kept");
         assert!(
             msg.contains("480 earlier lines"),
@@ -1718,7 +2202,13 @@ mod tests {
         let cfg = test_cfg(vec!["node_modules/**"]);
         let args = check_argv(&cfg, &project_with(vec![]), "/tmp/x", "gdrive:proj/x").unwrap();
 
-        for expected in ["--use-json-log", "--stats", "2s", "--stats-log-level", "NOTICE"] {
+        for expected in [
+            "--use-json-log",
+            "--stats",
+            "2s",
+            "--stats-log-level",
+            "NOTICE",
+        ] {
             assert!(
                 args.iter().any(|a| a == expected),
                 "{} is what makes a check report progress and classify its own output: {:?}",
@@ -1751,7 +2241,10 @@ mod tests {
         // is a run that produced no usable verdict, and each must be an error —
         // an unreachable remote must not clear a project's diff badge.
         let failures: [(&str, i32); 4] = [
-            ("Failed to create file system for \"gdrive:\": couldn't fetch token", 7),
+            (
+                "Failed to create file system for \"gdrive:\": couldn't fetch token",
+                7,
+            ),
             ("", 3),
             ("ERROR: 2 differences found", 1), // exit 1, nothing itemized
             ("! unreadable.txt\n= a.txt\n", 0), // rclone could not compare a file
@@ -1795,9 +2288,20 @@ mod tests {
         let has_flag = |args: &[String]| args.iter().any(|a| a == "--fast-list");
 
         let push = sync_argv(&cfg, &project, "push", "/tmp/local", "gdrive:proj/x", false).unwrap();
-        assert!(has_flag(&push), "the measured 5x win is on push and must reach it");
+        assert!(
+            has_flag(&push),
+            "the measured 5x win is on push and must reach it"
+        );
 
-        let dry = sync_argv(&cfg, &project, "dry-run", "/tmp/local", "gdrive:proj/x", true).unwrap();
+        let dry = sync_argv(
+            &cfg,
+            &project,
+            "dry-run",
+            "/tmp/local",
+            "gdrive:proj/x",
+            true,
+        )
+        .unwrap();
         assert!(
             !has_flag(&dry),
             "only the literal push mode opts in; anything else must not inherit it by accident"
@@ -1807,7 +2311,10 @@ mod tests {
         // recursive listing that omitted a remote file would make the user's
         // local file look destination-only and delete it.
         let pull = sync_argv(&cfg, &project, "pull", "/tmp/local", "gdrive:proj/x", false).unwrap();
-        assert!(!has_flag(&pull), "a listing-strategy flag must never reach an operation that deletes locally");
+        assert!(
+            !has_flag(&pull),
+            "a listing-strategy flag must never reach an operation that deletes locally"
+        );
 
         // A short remote listing hides a REMOTE-ONLY file from both inputs, so
         // rclone reports nothing and the verdict returns `synced`. A check writes
@@ -1834,9 +2341,10 @@ mod tests {
     ///
     /// That cancellation is the whole safety property, and it rests on one
     /// filter set governing both paths. It breaks where the two sides record the
-    /// same file under different names — macOS NFD locally against NFC on Drive
-    /// or OneDrive, or a case-insensitive remote — because one pattern then
-    /// matches only one side's listing. See `do/state.md` for the evidence.
+    /// same file under different names — a normalized local name against a
+    /// differently normalized remote name, or a case-insensitive remote —
+    /// because one pattern then matches only one side's listing. The behavior
+    /// is covered by the parity and refusal tests.
     ///
     /// `--delete-excluded` removes the property outright, and is one careless
     /// line from here: with a non-empty copy queue it wipes the destination of
@@ -1849,7 +2357,8 @@ mod tests {
     /// safety stop and receive the one assurance that must never be wrong.
     #[test]
     fn a_pre_apply_stop_is_classified_from_the_structured_message_only() {
-        let stop_in_msg = r#"{"level":"error","msg":"Safety abort: too many deletes (>50%, 3 of 4)"}"#;
+        let stop_in_msg =
+            r#"{"level":"error","msg":"Safety abort: too many deletes (>50%, 3 of 4)"}"#;
         let (_, is_stop) = render_log_line(stop_in_msg);
         assert!(is_stop, "rclone's own safety message must be recognised");
 
@@ -1880,11 +2389,21 @@ mod tests {
         // And the message the user gets, driven by the typed flag.
         let stopped = bisync_failure(1, "whatever rclone printed", true);
         assert!(stopped.contains("stopped BEFORE applying"));
-        assert!(stopped.contains("Resync button"), "recovery must point at the app's own action");
-        assert!(stopped.contains("Do NOT use the `--force`"), "rclone suggests --force; contradict it");
         assert!(
-            !bisync_failure(1, "ERROR : Bisync aborted. Must run --resync to recover.", false)
-                .contains("stopped BEFORE applying"),
+            stopped.contains("Resync button"),
+            "recovery must point at the app's own action"
+        );
+        assert!(
+            stopped.contains("Do NOT use the `--force`"),
+            "rclone suggests --force; contradict it"
+        );
+        assert!(
+            !bisync_failure(
+                1,
+                "ERROR : Bisync aborted. Must run --resync to recover.",
+                false
+            )
+            .contains("stopped BEFORE applying"),
             "a generic abort can follow completed operations and gets no safety claim"
         );
     }
@@ -1942,6 +2461,7 @@ esac
         let mut cfg = test_cfg(vec![]);
         cfg.rclone_path = fake.to_string_lossy().into_owned();
         let project = |label: &str, local: &std::path::Path| Project {
+            id: String::new(),
             name: format!(
                 "structured-stop-{}-{}",
                 label,
@@ -1954,6 +2474,10 @@ esac
             remote_path: String::new(),
             remote: "gdrive".into(),
             excludes: Vec::new(),
+            schedule: None,
+            schedule_error: None,
+            legacy_schedule: None,
+            legacy_schedule_raw: None,
         };
 
         let positive_error = bisync_project(&cfg, &project("positive", &positive), false)
@@ -2024,14 +2548,23 @@ esac
         let inline = exclude_args(&cfg, &project).unwrap();
         // `--filters-file` is bisync's own flag; `--filter-from` is the global
         // reader of the identical rule syntax, and is what `lsf` accepts.
-        let via_file = vec!["--filter-from".to_string(), file.to_string_lossy().into_owned()];
+        let via_file = vec![
+            "--filter-from".to_string(),
+            file.to_string_lossy().into_owned(),
+        ];
 
         let a = count(inline);
         let b = count(via_file);
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(a, "src/main.rs", "sanity: the excludes must actually exclude");
-        assert_eq!(a, b, "the guard's filters and bi-sync's filters must select the same files");
+        assert_eq!(
+            a, "src/main.rs",
+            "sanity: the excludes must actually exclude"
+        );
+        assert_eq!(
+            a, b,
+            "the guard's filters and bi-sync's filters must select the same files"
+        );
     }
 
     #[test]
@@ -2055,7 +2588,35 @@ esac
         );
 
         let resync = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", true).unwrap();
-        assert!(resync.iter().any(|a| a == "--resync"), "the migration path must opt in explicitly");
+        assert!(
+            resync.iter().any(|a| a == "--resync"),
+            "the migration path must opt in explicitly"
+        );
+    }
+
+    #[test]
+    fn rewriting_an_existing_filters_file_works() {
+        let cfg = test_cfg(vec!["node_modules/**"]);
+        let project = project_with(vec!["artifacts/**"]);
+        let first = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", false).unwrap();
+        let first_path = first
+            .windows(2)
+            .find(|pair| pair[0] == "--filters-file")
+            .map(|pair| pair[1].clone())
+            .expect("the production bi-sync argv must include its filters file");
+
+        let second = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", false)
+            .expect("rewriting the same filters file must work on every platform");
+        let second_path = second
+            .windows(2)
+            .find(|pair| pair[0] == "--filters-file")
+            .map(|pair| pair[1].clone())
+            .expect("the second production argv must include its filters file");
+        assert_eq!(first_path, second_path);
+        assert_eq!(
+            fs::read_to_string(first_path).unwrap(),
+            render_filters_file(&cfg, &project).unwrap()
+        );
     }
 
     /// The property the whole filters-file change exists for, proved against the
@@ -2088,10 +2649,16 @@ esac
         };
 
         fs::write(&filters, "- nothing-matches-this/**\n").unwrap();
-        assert!(bisync(&["--resync"]).status.success(), "the initial resync must establish a history");
+        assert!(
+            bisync(&["--resync"]).status.success(),
+            "the initial resync must establish a history"
+        );
         let before_a = tree_snapshot(&a);
         let before_b = tree_snapshot(&b);
-        assert_eq!(before_a, before_b, "sanity: the initial resync must copy the whole corpus");
+        assert_eq!(
+            before_a, before_b,
+            "sanity: the initial resync must copy the whole corpus"
+        );
 
         // Exactly what shipping a new default exclude does to an existing history.
         fs::write(&filters, "- junk/**\n").unwrap();
@@ -2101,7 +2668,10 @@ esac
         let after_b = tree_snapshot(&b);
         fs::remove_dir_all(&dir).ok();
 
-        assert!(!out.status.success(), "a changed filter set must not run as an ordinary bi-sync");
+        assert!(
+            !out.status.success(),
+            "a changed filter set must not run as an ordinary bi-sync"
+        );
         assert!(
             text.contains("filters file has changed"),
             "rclone's own fail-closed check is the point; got: {}",
@@ -2113,7 +2683,10 @@ esac
         // structured record. Feeding rclone's own wording through the classifier
         // ties the phrase it really emits to the phrase we match — a rename
         // upstream breaks this test rather than silently disabling the guidance.
-        let line = text.lines().find(|l| l.contains("filters file has changed")).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.contains("filters file has changed"))
+            .unwrap();
         let msg = line.split("ERROR : ").last().unwrap_or(line).trim();
         let record = serde_json::json!({ "level": "error", "msg": msg }).to_string();
         assert!(
@@ -2153,22 +2726,23 @@ esac
 
         // A blank row in a settings box is not a filter.
         assert_eq!(
-            effective_excludes(&test_cfg(vec![]), &project_with(vec!["", "   "])).unwrap().len(),
+            effective_excludes(&test_cfg(vec![]), &project_with(vec!["", "   "]))
+                .unwrap()
+                .len(),
             0
         );
     }
 
-    /// A known-answer vector for the digest. It is persistent on-disk identity:
-    /// the filters file and rclone's `.md5` sidecar are keyed on the path it
-    /// produces, so changing the algorithm later renames every project's history
-    /// and forces a resync. The absence of this test is why a wrong multiplier
-    /// (a digit too long, so not FNV-1a at all) survived review.
+    /// A known-answer vector for the identity digest. It is persistent on-disk
+    /// identity: the filters file and rclone's `.md5` sidecar are keyed on the
+    /// path it produces, so changing the algorithm later renames every
+    /// project's history and forces a resync.
     #[test]
-    fn the_name_digest_is_really_fnv_1a() {
+    fn the_identity_digest_is_really_fnv_1a() {
         // Canonical FNV-1a 64-bit vectors.
-        assert_eq!(name_digest(""), 0xcbf2_9ce4_8422_2325, "offset basis");
-        assert_eq!(name_digest("a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(name_digest("foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(identity_digest(""), 0xcbf2_9ce4_8422_2325, "offset basis");
+        assert_eq!(identity_digest("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(identity_digest("foobar"), 0x8594_4171_f739_67e8);
     }
 
     /// Two projects must never share a filters file, because rclone stores its
@@ -2177,26 +2751,138 @@ esac
     /// three operations able to run at once, one could rewrite the other's
     /// filters between argv construction and rclone reading them.
     #[test]
-    fn project_names_that_look_alike_do_not_share_a_filters_file() {
-        let named = |n: &str| Project { name: n.into(), ..project_with(vec![]) };
-        let collide = ["a.b", "a b", "a_b", "a-b", "A_B", "a/b"];
+    fn duplicate_name_projects_have_independent_identity() {
+        let first = Project {
+            id: "p_first".into(),
+            name: "same-name".into(),
+            ..project_with(vec![])
+        };
+        let second = Project {
+            id: "p_second".into(),
+            name: "same-name".into(),
+            ..project_with(vec![])
+        };
+        assert_ne!(
+            filters_file_path(&first).unwrap(),
+            filters_file_path(&second).unwrap(),
+            "equal display names must not share a protected history"
+        );
 
-        let mut seen = std::collections::HashSet::new();
-        for name in collide {
-            let path = filters_file_path(&named(name)).unwrap();
-            assert!(
-                seen.insert(path.clone()),
-                "{:?} collided with an earlier name at {}",
-                name,
-                path.display()
-            );
-        }
-        // Stable across calls: rclone's sidecar is keyed on this path.
-        assert_eq!(filters_file_path(&named("a.b")).unwrap(), filters_file_path(&named("a.b")).unwrap());
-        // And it cannot escape its directory.
-        let escaped = filters_file_path(&named("../../etc/passwd")).unwrap();
+        let renamed = Project {
+            name: "new-name".into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            filters_file_path(&first).unwrap(),
+            filters_file_path(&renamed).unwrap(),
+            "renaming a project must not move its protected history"
+        );
+
+        // The ID-derived filename cannot escape its directory.
+        let escaped = filters_file_path(&Project {
+            id: "../../etc/passwd".into(),
+            ..first
+        })
+        .unwrap();
         assert!(escaped.to_string_lossy().contains("bisync-filters"));
         assert!(!escaped.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn orphan_legacy_filters_require_explicit_resync() {
+        for (label, mut cfg) in [("zero", test_cfg(vec![])), ("one", test_cfg(vec![]))] {
+            let mut project = project_with(vec![]);
+            project.id = format!("p_legacy_{label}");
+            project.name = format!("legacy-orphan-{label}");
+            if label == "one" {
+                let mut current = project.clone();
+                current.id = "p_current_same_name".into();
+                cfg.projects.push(current);
+            }
+
+            let legacy = legacy_filters_file_path(&project).unwrap();
+            let destination = filters_file_path(&project).unwrap();
+            let old_sidecar = filters_sidecar(&legacy);
+            let new_sidecar = filters_sidecar(&destination);
+            for path in [&legacy, &destination, &old_sidecar, &new_sidecar] {
+                let _ = fs::remove_file(path);
+            }
+
+            fs::write(&legacy, b"- artifacts/**\n").unwrap();
+            let error = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", false)
+                .expect_err("ordinary bi-sync must not adopt name-based history");
+            assert!(error.contains("explicit per-project resync"), "{error}");
+            assert!(!destination.exists());
+
+            let args = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", true)
+                .expect("explicit resync is the deliberate adoption/recovery path");
+            assert!(args.iter().any(|arg| arg == "--resync"));
+            assert!(destination.exists());
+
+            for path in [&legacy, &destination, &old_sidecar, &new_sidecar] {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_legacy_filters_history_requires_explicit_resync() {
+        let mut first = project_with(vec![]);
+        first.id = "p_legacy_first".into();
+        first.name = "legacy-ambiguous-test".into();
+        let second = Project {
+            id: "p_legacy_second".into(),
+            ..first.clone()
+        };
+        let mut cfg = test_cfg(vec![]);
+        cfg.projects.extend([first.clone(), second]);
+        let legacy = legacy_filters_file_path(&first).unwrap();
+        let destination = filters_file_path(&first).unwrap();
+        let old_sidecar = filters_sidecar(&legacy);
+        for path in [
+            &legacy,
+            &destination,
+            &old_sidecar,
+            &filters_sidecar(&destination),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+        fs::write(&legacy, b"- artifacts/**\n").unwrap();
+
+        let error = reject_legacy_filters_without_provenance(&first, &destination)
+            .expect_err("duplicate names must not silently inherit name-based history");
+        assert!(error.contains("explicit per-project resync"));
+        assert!(!destination.exists());
+        let _ = fs::remove_file(legacy);
+    }
+
+    #[test]
+    fn explicit_resync_starts_a_new_id_based_filters_history() {
+        let mut first = project_with(vec![]);
+        first.id = "p_resync_first".into();
+        first.name = "resync-ambiguous-test".into();
+        let second = Project {
+            id: "p_resync_second".into(),
+            ..first.clone()
+        };
+        let mut cfg = test_cfg(vec![]);
+        cfg.projects.extend([first.clone(), second]);
+        let legacy = legacy_filters_file_path(&first).unwrap();
+        let destination = filters_file_path(&first).unwrap();
+        let old_sidecar = filters_sidecar(&legacy);
+        let new_sidecar = filters_sidecar(&destination);
+        for path in [&legacy, &destination, &old_sidecar, &new_sidecar] {
+            let _ = fs::remove_file(path);
+        }
+        fs::write(&legacy, b"- stale/**\n").unwrap();
+
+        let args = bisync_argv(&cfg, &first, "/tmp/local", "gdrive:proj/x", true).unwrap();
+        assert!(args.iter().any(|arg| arg == "--resync"));
+        assert_eq!(fs::read(&destination).unwrap(), b"# Generated by rcsync. Editing this file by hand will make the\n# next bi-sync refuse until an explicit resync.\n");
+
+        for path in [&legacy, &destination, &old_sidecar, &new_sidecar] {
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -2205,7 +2891,12 @@ esac
         let project = project_with(vec!["artifacts/**"]);
         let args = bisync_argv(&cfg, &project, "/tmp/local", "gdrive:proj/x", false).unwrap();
 
-        for forbidden in ["--delete-excluded", "--force", "--ignore-errors", "--resync"] {
+        for forbidden in [
+            "--delete-excluded",
+            "--force",
+            "--ignore-errors",
+            "--resync",
+        ] {
             assert!(
                 !args.iter().any(|a| a == forbidden),
                 "{} turns a filter change from a no-op into data loss",
@@ -2261,15 +2952,14 @@ esac
     /// binary, since rclone's matcher is the only authority on its own globs.
     #[test]
     fn the_shipped_defaults_do_not_over_match() {
-        let defaults: Vec<String> = serde_json::from_str::<serde_json::Value>(
-            include_str!("../defaults.json"),
-        )
-        .unwrap()["excludes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
+        let defaults: Vec<String> =
+            serde_json::from_str::<serde_json::Value>(include_str!("../defaults.json")).unwrap()
+                ["excludes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
 
         let dir = temp_dir("default-filter-corpus");
         // Must be excluded: the gap that motivated widening the venv pattern.
@@ -2294,14 +2984,22 @@ esac
 
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(kept.unwrap(), 2, "kept the wrong set:\n{}", listed);
-        assert!(!listed.contains(".venv314"), "a virtualenv must be excluded:\n{}", listed);
+        assert!(
+            !listed.contains(".venv314"),
+            "a virtualenv must be excluded:\n{}",
+            listed
+        );
         assert!(
             listed.contains("quarantined-data/records.csv"),
             "a stranger's directory that merely starts with 'quarantine' must survive \
              the shipped defaults — they cannot remove one:\n{}",
             listed
         );
-        assert!(listed.contains(".venv-notes.md"), "a file is not a virtualenv:\n{}", listed);
+        assert!(
+            listed.contains(".venv-notes.md"),
+            "a file is not a virtualenv:\n{}",
+            listed
+        );
     }
 
     // --- structured log: a heartbeat is a snapshot, not an event ---
@@ -2327,10 +3025,12 @@ esac
     /// log and the returned text, both left 41 tests passing.
     #[test]
     fn the_router_sends_events_to_the_log_and_keeps_heartbeats_out_of_the_record() {
-        let mut router = StderrRouter::new("test-router");
+        let mut router = StderrRouter::new("test-router-id", "test-router");
         let stream = [
             r#"{"level":"info","msg":"Copied (new)","object":"src/main.ts"}"#,
-            &stats_record("\"bytes\":330079,\"totalBytes\":330079,\"transfers\":12,\"totalTransfers\":12"),
+            &stats_record(
+                "\"bytes\":330079,\"totalBytes\":330079,\"transfers\":12,\"totalTransfers\":12",
+            ),
             r#"{"level":"error","msg":"permission denied","object":"data/locked.md"}"#,
             &stats_record("\"checks\":900,\"totalChecks\":48471"),
         ];
@@ -2346,8 +3046,15 @@ esac
         let (text, _) = router.finish();
 
         // Both heartbeats reached the progress channel and nothing else did.
-        assert_eq!(sent_progress.len(), 2, "every heartbeat must reach the progress row: {:?}", sent_progress);
-        assert!(sent_progress.iter().all(|p| p.contains("files") || p.contains("checked")));
+        assert_eq!(
+            sent_progress.len(),
+            2,
+            "every heartbeat must reach the progress row: {:?}",
+            sent_progress
+        );
+        assert!(sent_progress
+            .iter()
+            .all(|p| p.contains("files") || p.contains("checked")));
 
         // Both events reached the log, and neither heartbeat did.
         assert_eq!(
@@ -2357,9 +3064,13 @@ esac
             sent_log
         );
         assert!(sent_log.iter().any(|l| l == "src/main.ts: Copied (new)"));
-        assert!(sent_log.iter().any(|l| l.starts_with("ERROR data/locked.md: ")));
+        assert!(sent_log
+            .iter()
+            .any(|l| l.starts_with("ERROR data/locked.md: ")));
         assert!(
-            !sent_log.iter().any(|l| l.contains("KiB") || l.contains("checked")),
+            !sent_log
+                .iter()
+                .any(|l| l.contains("KiB") || l.contains("checked")),
             "a heartbeat reached the log — that is the flood this exists to stop: {:?}",
             sent_log
         );
@@ -2382,10 +3093,26 @@ esac
             "\"bytes\":178636,\"totalBytes\":178636,\"transfers\":14,\"totalTransfers\":14,\
              \"eta\":0,\"listed\":119932",
         ));
-        assert!(!caught_up.contains("100%"), "a partial denominator is not completion: {:?}", caught_up);
-        assert!(!caught_up.contains("ETA 0s"), "nor is an ETA over it: {:?}", caught_up);
-        assert!(caught_up.contains("14 / 14 files"), "what it HAS done still shows: {:?}", caught_up);
-        assert!(caught_up.contains("still scanning — 119932 listed"), "{:?}", caught_up);
+        assert!(
+            !caught_up.contains("100%"),
+            "a partial denominator is not completion: {:?}",
+            caught_up
+        );
+        assert!(
+            !caught_up.contains("ETA 0s"),
+            "nor is an ETA over it: {:?}",
+            caught_up
+        );
+        assert!(
+            caught_up.contains("14 / 14 files"),
+            "what it HAS done still shows: {:?}",
+            caught_up
+        );
+        assert!(
+            caught_up.contains("still scanning — 119932 listed"),
+            "{:?}",
+            caught_up
+        );
 
         // Mid-transfer, with work still outstanding, the percentage is real.
         let working = progress_of(&stats_record(
@@ -2407,8 +3134,19 @@ esac
             "\"bytes\":165040,\"totalBytes\":330079,\"speed\":9198.0,\"eta\":30,\
              \"transfers\":9,\"totalTransfers\":12,\"errors\":4",
         ));
-        for expected in ["161.17 KiB / 322.34 KiB", "50%", "ETA 30s", "9 / 12 files", "4 errors"] {
-            assert!(text.contains(expected), "{:?} missing from {:?}", expected, text);
+        for expected in [
+            "161.17 KiB / 322.34 KiB",
+            "50%",
+            "ETA 30s",
+            "9 / 12 files",
+            "4 errors",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{:?} missing from {:?}",
+                expected,
+                text
+            );
         }
     }
 
@@ -2418,7 +3156,11 @@ esac
         // line, or a check reads "0 B / 0 B, 100%" and a push reads "0 checked".
         let check = progress_of(&stats_record("\"checks\":900,\"totalChecks\":48471"));
         assert!(check.contains("900 / 48471 checked"), "{:?}", check);
-        assert!(!check.contains("files") && !check.contains(" / 0 B"), "{:?}", check);
+        assert!(
+            !check.contains("files") && !check.contains(" / 0 B"),
+            "{:?}",
+            check
+        );
 
         let push = progress_of(&stats_record("\"transfers\":3,\"totalTransfers\":9"));
         assert!(push.contains("3 / 9 files"), "{:?}", push);
@@ -2444,7 +3186,11 @@ esac
             "\"listed\":9,\"bytes\":50,\"totalBytes\":100,\"transfers\":1,\"totalTransfers\":2",
         ));
         assert!(transferring.contains("1 / 2 files"), "{:?}", transferring);
-        assert!(!transferring.contains("listed"), "scan text must not linger: {:?}", transferring);
+        assert!(
+            !transferring.contains("listed"),
+            "scan text must not linger: {:?}",
+            transferring
+        );
     }
 
     #[test]
@@ -2529,7 +3275,12 @@ esac
         // Each of these once had to be distinguished from a genuine zero. If any
         // started returning Ok(0), a push would refuse; if any returned a count,
         // a push would proceed on a guess. Both are wrong — only Err is right.
-        for bad in ["", "rclone: command not found", "{\"bytes\":10}", "{ not json"] {
+        for bad in [
+            "",
+            "rclone: command not found",
+            "{\"bytes\":10}",
+            "{ not json",
+        ] {
             assert!(
                 parse_rclone_size_count(bad).is_err(),
                 "unreadable rclone output must fail closed, got Ok for {:?}",
@@ -2540,6 +3291,9 @@ esac
 
     #[test]
     fn an_explicit_zero_count_is_read_as_zero() {
-        assert_eq!(parse_rclone_size_count("{\"count\":0,\"bytes\":0}").unwrap(), 0);
+        assert_eq!(
+            parse_rclone_size_count("{\"count\":0,\"bytes\":0}").unwrap(),
+            0
+        );
     }
 }

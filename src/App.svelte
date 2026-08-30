@@ -4,10 +4,12 @@
   import Dashboard from "./lib/Dashboard.svelte";
   import Settings from "./lib/Settings.svelte";
   import BrowseRemote from "./lib/BrowseRemote.svelte";
+  import ScheduleManager from "./lib/ScheduleManager.svelte";
   import logo from "./assets/logo.png";
 
   let showSettings = $state(false);
   let showBrowse = $state(false);
+  let showSchedules = $state(false);
   let settingsConfig: AppConfig | null = $state(null);
   let theme = $state(localStorage.getItem("rcsync-theme") || "dark");
 
@@ -43,6 +45,15 @@
     showBrowse = true;
   }
 
+  function openSchedules() {
+    showSchedules = true;
+  }
+
+  function closeSchedules() {
+    showSchedules = false;
+    reloadDashboard();
+  }
+
   function closeBrowse() {
     showBrowse = false;
     reloadDashboard();
@@ -52,9 +63,11 @@
   if (typeof window !== "undefined") {
     window.addEventListener("open-settings", () => openSettings());
     window.addEventListener("open-browse", () => openBrowse());
+    window.addEventListener("open-schedules", openSchedules);
     window.addEventListener("close-overlays", () => {
       if (showSettings) { closeSettings(); }
       else if (showBrowse) { closeBrowse(); }
+      else if (showSchedules) { closeSchedules(); }
     });
   }
 </script>
@@ -66,6 +79,7 @@
       <span class="brand">rcsync</span>
     </div>
     <div class="nav-right">
+      <button class="nav-btn" onclick={openSchedules}>Schedules</button>
       <button class="nav-btn" onclick={openBrowse}>Browse Remote</button>
       <button class="nav-btn icon-btn" onclick={toggleTheme} title="Toggle theme">
         {#if theme === "dark"}
@@ -90,6 +104,10 @@
 
   {#if showBrowse}
     <BrowseRemote onclose={closeBrowse} />
+  {/if}
+
+  {#if showSchedules}
+    <ScheduleManager onclose={closeSchedules} />
   {/if}
 </div>
 

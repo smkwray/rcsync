@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import type { CheckStatus, Project, RemoteConfig, SyncMode } from "./types";
+  import type { CheckStatus, Project, RemoteConfig, ScheduleStatus, SyncMode } from "./types";
+  import ScheduleEditor from "./ScheduleEditor.svelte";
 
   let {
     project,
@@ -12,9 +13,14 @@
     onaction,
     oncancel,
     ondelete,
+    onreattach,
     onpin,
     onupdated,
     needsResync = false,
+    scheduleStatus = null,
+    scheduleRequest = 0,
+    retired = false,
+    retiredTarget = null,
   }: {
     project: Project;
     running: boolean;
@@ -25,10 +31,15 @@
     onaction: (project: Project, mode: SyncMode) => void;
     oncancel: (project: Project) => void;
     ondelete: (project: Project) => void;
+    onreattach: (project: Project) => void;
     onpin: (project: Project) => void;
     onupdated?: () => void;
     /** Set after a bi-sync on this project stopped before applying anything. */
     needsResync?: boolean;
+    scheduleStatus: ScheduleStatus | null;
+    scheduleRequest: number;
+    retired: boolean;
+    retiredTarget: string | null;
   } = $props();
 
   /** The action row, in display order. While an operation runs, the button that
@@ -66,12 +77,22 @@
   let ignoreError = $state("");
   let ignoreTextarea: HTMLTextAreaElement | undefined = $state(undefined);
 
+  let showSchedule = $state(false);
+  let seenScheduleRequest = $state(0);
+
+  $effect(() => {
+    if (scheduleRequest > 0 && scheduleRequest !== seenScheduleRequest) {
+      seenScheduleRequest = scheduleRequest;
+      showSchedule = true;
+    }
+  });
+
   $effect(() => { if (showIgnores) ignoreTextarea?.focus(); });
 
   async function openIgnores() {
     ignoreError = "";
     try {
-      const patterns = await invoke<string[]>("get_project_excludes", { projectName: project.name });
+      const patterns = await invoke<string[]>("get_project_excludes", { projectName: project.name, projectId: project.id });
       ignoreText = patterns.join("\n");
     } catch (e) {
       ignoreText = "";
@@ -94,7 +115,7 @@
       .split("\n")
       .filter((l) => l.trim().length > 0);
     try {
-      await invoke("set_project_excludes", { projectName: project.name, excludes: patterns });
+      await invoke("set_project_excludes", { projectName: project.name, projectId: project.id, excludes: patterns });
       showIgnores = false;
     } catch (e) {
       ignoreError = `${e}`;
@@ -139,8 +160,9 @@
     try {
       await invoke("set_project_remote", {
         projectName: project.name,
+        projectId: project.id,
         remote: remoteChoice,
-        remotePath: remotePathInput.trim(),
+        remotePath: remotePathInput,
       });
       showRemote = false;
       onupdated?.();
@@ -189,7 +211,7 @@
         </svg>
       </button>
     </div>
-    <div class="header-right">
+    <div class="header-status">
       {#if running}
         <span class="badge running-badge">{runLabel()}</span>
       {:else if checkStatus}
@@ -208,6 +230,17 @@
           <span class="check-time">{checkStatus.time}</span>
         </div>
       {/if}
+    </div>
+    <div class="header-tools" aria-label="Project tools">
+      <button class="icon-btn schedule-btn" class:scheduled={project.schedule} class:pending={scheduleStatus?.pending}
+        disabled={retired}
+        title={retired ? "This remote target was retired; reattach it before scheduling" : (project.schedule ? `Scheduled Push: ${scheduleStatus?.next_run ?? "active"}` : "Schedule Push")}
+        onclick={() => showSchedule = true}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>
+        </svg>
+        {#if project.schedule}<span class="schedule-dot"></span>{/if}
+      </button>
       <button class="icon-btn" title="Project-specific ignores" onclick={openIgnores}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
@@ -241,11 +274,25 @@
           {cancelling ? "Stopping…" : "Cancel"}
         </button>
       {:else}
-        <button class={cls} disabled={running} onclick={() => onaction(project, mode)}>{label}</button>
+        <button class={cls}
+          disabled={running || (retired && (mode === "push" || mode === "bisync" || mode === "resync"))}
+          title={retired && (mode === "push" || mode === "bisync" || mode === "resync") ? "This remote target was retired; reattach it before writing" : undefined}
+          onclick={() => onaction(project, mode)}>{label}</button>
       {/if}
     {/each}
   </div>
 </div>
+
+{#if retired}
+  <div class="retired-warning" role="status">
+    <div>
+      <strong>Retired remote target</strong>
+      <span>{retiredTarget ?? `${project.remote}:${project.remote_path}`}</span>
+      <small>This local folder may be a stale leftover from another device. Remote-writing operations are blocked.</small>
+    </div>
+    <button class="reattach-btn" onclick={() => onreattach(project)}>Reattach…</button>
+  </div>
+{/if}
 
 {#if showIgnores}
   <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onkeydown={handleIgnoreKey}>
@@ -307,6 +354,16 @@
   </div>
 {/if}
 
+{#if showSchedule}
+  <ScheduleEditor
+    project={project}
+    schedule={project.schedule ?? null}
+    nextRun={scheduleStatus?.next_run ?? null}
+    onclose={() => showSchedule = false}
+    onupdated={() => onupdated?.()}
+  />
+{/if}
+
 <style>
   .card {
     background: var(--bg-card);
@@ -324,15 +381,23 @@
   .card.unknown { border-left: 3px solid var(--text-muted); }
 
   .card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(120px, 1fr);
+    align-items: start;
     margin-bottom: 10px;
     gap: 8px;
   }
 
   .name-row { display: flex; align-items: center; gap: 6px; }
   .name { font-size: 16px; font-weight: 600; }
+  .header-status { grid-column: 2; justify-self: center; min-width: 84px; }
+  .header-tools {
+    grid-column: 3;
+    justify-self: end;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
 
   .pin-btn {
     padding: 2px;
@@ -346,12 +411,10 @@
   .pin-btn:hover { opacity: 1; color: var(--yellow); background: transparent; border: none; }
   .pin-btn.pinned { opacity: 1; color: var(--yellow); }
 
-  .header-right { display: flex; align-items: flex-start; gap: 6px; }
-
   .check-info {
     display: flex;
     flex-direction: column;
-    align-items: flex-end;
+    align-items: center;
     gap: 2px;
   }
 
@@ -388,6 +451,10 @@
   }
   .icon-btn:hover { opacity: 1; color: var(--accent); background: transparent; border: none; }
   .trash-btn:hover { opacity: 1; color: var(--red); background: transparent; border: none; }
+  .schedule-btn { position: relative; }
+  .schedule-btn.scheduled { opacity: 0.9; color: var(--accent); }
+  .schedule-btn.pending { color: var(--yellow); }
+  .schedule-dot { position: absolute; right: 2px; bottom: 1px; width: 4px; height: 4px; border-radius: 50%; background: var(--green); }
 
   /* Folder icon relocated next to the project name */
   .name-folder-btn { padding: 2px 3px; opacity: 0.35; }
@@ -413,6 +480,24 @@
   }
 
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .retired-warning {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 9px 11px;
+    border: 1px solid #eab308;
+    border-radius: 8px;
+    background: rgba(234, 179, 8, 0.08);
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .retired-warning > div { display: grid; gap: 2px; min-width: 0; }
+  .retired-warning strong { color: #facc15; font-size: 12px; }
+  .retired-warning span { color: var(--text); font-family: var(--font-mono); overflow-wrap: anywhere; }
+  .retired-warning small { line-height: 1.35; }
+  .reattach-btn { flex: 0 0 auto; color: #facc15; border-color: #eab308; }
   button.warn { border-color: var(--yellow); color: var(--yellow); }
   button.warn:hover { background: var(--yellow-dim); }
 
@@ -425,6 +510,14 @@
     font-weight: 600;
   }
   .cancel-op:hover:not(:disabled) { background: var(--red); color: var(--bg); }
+
+  @media (max-width: 520px) {
+    .card { padding: 12px; }
+    .card-header { grid-template-columns: minmax(0, 1fr) auto; }
+    .header-status { grid-column: 2; }
+    .name-row { grid-column: 1; grid-row: 1; }
+    .header-tools { grid-column: 1 / -1; grid-row: 2; justify-self: end; }
+  }
 
   /* Project-specific ignores dialog */
   .overlay {
