@@ -2,6 +2,8 @@
   import { invoke } from "@tauri-apps/api/core";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import type { AppConfig, Project } from "./types";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
+  import { mergeSettingsProjects } from "./settingsState.js";
 
   let {
     config,
@@ -15,8 +17,12 @@
   let newExclude = $state("");
   let newScanDir = $state("");
   let saving = $state(false);
-  let newProject: Project = $state({ name: "", local_path: "", remote_path: "" });
+  let error = $state("");
+  let newProject: Project = $state({ id: "", name: "", local_path: "", remote_path: "", remote: "", schedule: null });
   let startAtLogin = $state(false);
+  let confirmRemoveIndex = $state<number | null>(null);
+  let migratingLegacyHost = $state(false);
+  let legacyHostMigrated = $state(false);
 
   // Load current autostart state
   isEnabled().then((v) => { startAtLogin = v; }).catch(() => {});
@@ -29,20 +35,47 @@
         await disable();
       }
     } catch (e) {
-      alert(`Failed to update login item: ${e}`);
+      error = `Failed to update login item: ${e}`;
       startAtLogin = !startAtLogin; // revert
     }
   }
 
   async function save() {
     saving = true;
+    error = "";
     try {
-      await invoke("update_config", { cfg: editConfig });
+      // Settings predates the project-card editors and holds a full config
+      // snapshot. Refresh the project list immediately before saving so a
+      // concurrent schedule/ignore/remote edit is not overwritten. Explicit
+      // project removals from this Settings session still win; projects that
+      // appeared after it opened are retained.
+      const current = await invoke<AppConfig>("get_config");
+      const projects = mergeSettingsProjects(config.projects, current.projects, editConfig.projects);
+      await invoke("update_config", { cfg: { ...editConfig, projects } });
       onclose();
     } catch (e) {
-      alert(`Failed to save: ${e}`);
+      error = `Failed to save: ${e}`;
     } finally {
       saving = false;
+    }
+  }
+
+  async function migrateLegacyHost() {
+    if (migratingLegacyHost) return;
+    migratingLegacyHost = true;
+    error = "";
+    try {
+      const migrated = await invoke<boolean>("migrate_legacy_host_config");
+      if (!migrated) {
+        error = "No legacy host-specific config was found.";
+      } else {
+        legacyHostMigrated = true;
+        window.dispatchEvent(new CustomEvent("reload-projects"));
+      }
+    } catch (e) {
+      error = `Failed to convert the legacy config: ${e}`;
+    } finally {
+      migratingLegacyHost = false;
     }
   }
 
@@ -67,15 +100,18 @@
   function addProject() {
     if (newProject.name && newProject.local_path && newProject.remote_path) {
       editConfig.projects = [...editConfig.projects, { ...newProject }];
-      newProject = { name: "", local_path: "", remote_path: "" };
+      newProject = { id: "", name: "", local_path: "", remote_path: "", remote: "", schedule: null };
     }
   }
 
   function removeProject(idx: number) {
-    const name = editConfig.projects[idx].name;
-    if (confirm(`Remove project "${name}"?`)) {
-      editConfig.projects = editConfig.projects.filter((_, i) => i !== idx);
-    }
+    confirmRemoveIndex = idx;
+  }
+
+  function confirmRemoveProject() {
+    if (confirmRemoveIndex === null) return;
+    editConfig.projects = editConfig.projects.filter((_, i) => i !== confirmRemoveIndex);
+    confirmRemoveIndex = null;
   }
 
   function addScanDir() {
@@ -98,7 +134,22 @@
       <button onclick={onclose}>Close</button>
     </div>
 
+    {#if error}
+      <p class="error-banner" role="alert">{error}</p>
+    {/if}
+
     <div class="settings-body">
+      {#if config.legacy_host_config_available && !legacyHostMigrated}
+        <div class="migration-notice">
+          <div>
+            <strong>Legacy device-specific config found</strong>
+            <p>This older config is not selected automatically. Convert it to the shared base once, then manage schedules in Schedules.</p>
+          </div>
+          <button onclick={migrateLegacyHost} disabled={migratingLegacyHost}>
+            {migratingLegacyHost ? "Converting…" : "Convert here"}
+          </button>
+        </div>
+      {/if}
       <section>
         <h3>General</h3>
         <div class="field">
@@ -224,6 +275,17 @@
   </div>
 </div>
 
+{#if confirmRemoveIndex !== null}
+  <ConfirmDialog
+    title="Remove project?"
+    message={`Remove "${editConfig.projects[confirmRemoveIndex]?.name ?? "this project"}" from rcsync? This does not delete local or remote files.`}
+    confirmLabel="Remove"
+    danger={true}
+    onconfirm={confirmRemoveProject}
+    oncancel={() => confirmRemoveIndex = null}
+  />
+{/if}
+
 <style>
   .settings-overlay {
     position: fixed;
@@ -255,6 +317,17 @@
     border-bottom: 1px solid var(--border);
   }
 
+  .error-banner {
+    margin: 12px 20px 0;
+    padding: 9px 11px;
+    color: var(--red);
+    background: var(--bg-card);
+    border: 1px solid var(--red);
+    border-radius: 6px;
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+
   h2 {
     font-size: 16px;
     font-weight: 700;
@@ -266,6 +339,23 @@
     overflow-x: hidden;
     flex: 1;
   }
+
+  .migration-notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    margin-bottom: 20px;
+    padding: 10px 12px;
+    color: var(--yellow);
+    background: var(--bg-card);
+    border: 1px solid var(--yellow);
+    border-radius: 7px;
+    font-size: 12px;
+  }
+
+  .migration-notice strong { display: block; margin-bottom: 3px; }
+  .migration-notice p { color: var(--text-muted); line-height: 1.4; }
 
   section {
     margin-bottom: 24px;

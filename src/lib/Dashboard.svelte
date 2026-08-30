@@ -1,15 +1,26 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import type { AppConfig, BulkMode, CheckOutcome, CheckStatus, Project, ProjectStatus, SyncMode, SyncState } from "./types";
+  import type { AppConfig, BulkMode, CheckOutcome, CheckStatus, OperationSnapshot, Project, ProjectStatus, ScheduleStatus, ScheduledPushEvent, SyncMode, SyncState } from "./types";
   import ProjectCard from "./ProjectCard.svelte";
   import LogOutput from "./LogOutput.svelte";
   import ShortcutsHelp from "./ShortcutsHelp.svelte";
   import ConfirmDialog from "./ConfirmDialog.svelte";
+  import { applyScheduleEvent, cancelTarget, clearOperationState, markProjectModified, reconcileOperationSnapshots, setProjectStatus, toggleProjectId } from "./operationState.js";
 
   let projects: ProjectStatus[] = $state([]);
   let logLines: string[] = $state([]);
-  let runningProjects: Map<string, string> = $state(new Map()); // name -> mode
+  let runningProjects: Map<string, string> = $state(new Map()); // project ID -> mode
+  let runningDisplayNames: Map<string, string> = $state(new Map()); // project ID -> current display label
+  let scheduleStatuses: Map<string, ScheduleStatus> = $state(new Map());
+  let scheduleEventRevision = 0;
+  let scheduleEventStates: Map<string, {
+    revision: number;
+    pending?: boolean;
+    running?: boolean;
+    scheduled_running?: boolean;
+    terminal?: boolean;
+  }> = $state(new Map());
   let cancellingProjects: Set<string> = $state(new Set());
   /** Latest progress snapshot per project. Deliberately not part of `logLines`:
    *  rclone re-reports the same counters on a timer, so appending them filled
@@ -31,6 +42,8 @@
   let loaded = $state(false);
   let search = $state("");
   let selectedIndex = $state(-1);
+  let scheduleRequest = $state(0);
+  let scheduleTarget = $state(""); // immutable project ID
   let shortcutsEnabled = $state(localStorage.getItem("rcsync-shortcuts") === "true");
   let showShortcutsHelp = $state(false);
   let showOutput = $state(true);
@@ -49,28 +62,44 @@
   function onConfirmYes() { confirmState?.resolve(true); confirmState = null; }
   function onConfirmNo() { confirmState?.resolve(false); confirmState = null; }
 
-  // Key bumped to v2 with the shape change: the old {synced, diffs} entries are a
-  // cache any Check rebuilds, so they are dropped rather than migrated.
-  let checkStatuses: Record<string, CheckStatus> = $state(
-    JSON.parse(localStorage.getItem("rcsync-check-statuses-v2") || "{}")
-  );
-
-  function setStatus(name: string, state: SyncState, diffs = 0) {
-    checkStatuses = { ...checkStatuses, [name]: { time: shortTime(), state, diffs } };
+  // These caches are keyed by immutable project ID. The old name-keyed caches
+  // are deliberately ignored instead of migrated: duplicate names and renames
+  // make a name-to-ID migration unsafe.
+  function loadCheckStatuses(): Map<string, CheckStatus> {
+    try {
+      const raw: unknown = JSON.parse(localStorage.getItem("rcsync-check-statuses-v3") || "[]");
+      if (!Array.isArray(raw)) return new Map();
+      return new Map(raw.filter((entry): entry is [string, CheckStatus] =>
+        Array.isArray(entry) && typeof entry[0] === "string" && !!entry[1]));
+    } catch {
+      return new Map();
+    }
   }
 
-  function applyCheckOutcome(name: string, outcome: CheckOutcome) {
-    setStatus(name, outcome.synced ? "synced" : "diffs", outcome.differences);
+  let checkStatuses: Map<string, CheckStatus> = $state(loadCheckStatuses());
+
+  function setStatus(projectId: string, state: SyncState, diffs = 0) {
+    checkStatuses = setProjectStatus(checkStatuses, projectId, { time: shortTime(), state, diffs });
   }
 
-  // Pinned projects (stored by name)
-  let pinnedNames: string[] = $state(
-    JSON.parse(localStorage.getItem("rcsync-pinned") || "[]")
-  );
+  function applyCheckOutcome(projectId: string, outcome: CheckOutcome) {
+    setStatus(projectId, outcome.synced ? "synced" : "diffs", outcome.differences);
+  }
 
-  $effect(() => { localStorage.setItem("rcsync-check-statuses-v2", JSON.stringify(checkStatuses)); });
+  function loadPinnedIds(): string[] {
+    try {
+      const raw: unknown = JSON.parse(localStorage.getItem("rcsync-pinned-v2") || "[]");
+      return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  let pinnedIds: string[] = $state(loadPinnedIds());
+
+  $effect(() => { localStorage.setItem("rcsync-check-statuses-v3", JSON.stringify([...checkStatuses])); });
   $effect(() => { localStorage.setItem("rcsync-shortcuts", String(shortcutsEnabled)); });
-  $effect(() => { localStorage.setItem("rcsync-pinned", JSON.stringify(pinnedNames)); });
+  $effect(() => { localStorage.setItem("rcsync-pinned-v2", JSON.stringify(pinnedIds)); });
 
   $effect(() => {
     if (selectedIndex >= 0 && gridEl) {
@@ -80,17 +109,26 @@
   });
 
   let localProjects = $derived(projects.filter((p) => p.exists_locally));
-  let anyRunning = $derived(runningProjects.size > 0 || bulkMode !== null);
+  let anyPending = $derived([...scheduleStatuses.values()].some((status) => status.pending));
+  let anyRunning = $derived(runningProjects.size > 0 || bulkMode !== null || anyPending);
   // Gated on `runningProjects` as well as its own map, so a snapshot that
   // arrived just as an operation ended cannot leave a stale row on screen.
-  let activeProgress = $derived([...progress].filter(([name]) => runningProjects.has(name)));
+  let activeProgress = $derived(
+    [...progress]
+      .filter(([projectId]) => runningProjects.has(projectId))
+      .map(([projectId, text]) => ({
+        projectId,
+        name: runningDisplayNames.get(projectId) ?? projectId,
+        text,
+      }))
+  );
 
   // Sort: pinned first, then alphabetical
   let sortedProjects = $derived(() => {
-    const pinSet = new Set(pinnedNames);
+    const pinSet = new Set(pinnedIds);
     return [...localProjects].sort((a, b) => {
-      const ap = pinSet.has(a.name) ? 0 : 1;
-      const bp = pinSet.has(b.name) ? 0 : 1;
+      const ap = pinSet.has(a.id) ? 0 : 1;
+      const bp = pinSet.has(b.id) ? 0 : 1;
       if (ap !== bp) return ap - bp;
       return a.name.localeCompare(b.name);
     });
@@ -119,7 +157,7 @@
   }
 
   function toProject(ps: ProjectStatus): Project {
-    return { name: ps.name, local_path: ps.local_path, remote_path: ps.remote_path, remote: ps.remote };
+    return { id: ps.id, name: ps.name, local_path: ps.local_path, remote_path: ps.remote_path, remote: ps.remote, schedule: ps.schedule };
   }
 
   function ensureSelected(): ProjectStatus | null {
@@ -133,16 +171,61 @@
   // goes through here too, and previously each one kicked off another silent
   // check of every project.
   let didAutoCheck = false;
+  let shownConfigWarnings = false;
+  let loadGeneration = 0;
+
+  function noteScheduledState(
+    projectId: string,
+    state: { pending?: boolean; running?: boolean; scheduled_running?: boolean; terminal?: boolean },
+    phase?: ScheduledPushEvent["phase"],
+  ) {
+    const revision = ++scheduleEventRevision;
+    scheduleEventStates = new Map([...scheduleEventStates, [projectId, { ...state, revision }]]);
+    if (phase) {
+      scheduleStatuses = applyScheduleEvent(scheduleStatuses, { project_id: projectId, phase });
+    }
+  }
+
+  async function scheduledOperationActive(projectId: string): Promise<boolean> {
+    try {
+      const active = await invoke<OperationSnapshot[]>("get_active_operations");
+      return active.some((operation) => operation.project_id === projectId && operation.scheduled);
+    } catch {
+      return false;
+    }
+  }
 
   async function loadProjects() {
-    projects = await invoke<ProjectStatus[]>("get_projects_status");
+    const generation = ++loadGeneration;
+    const scheduleRevisionAtRequest = scheduleEventRevision;
+    const [nextProjects, cfg, active, schedules] = await Promise.all([
+      invoke<ProjectStatus[]>("get_projects_status"),
+      invoke<AppConfig>("get_config"),
+      invoke<OperationSnapshot[]>("get_active_operations"),
+      invoke<ScheduleStatus[]>("get_schedule_status"),
+    ]);
+    if (generation !== loadGeneration) return;
+    projects = nextProjects;
+    const reconciled = reconcileOperationSnapshots(
+      schedules,
+      active,
+      scheduleEventStates,
+      scheduleRevisionAtRequest,
+    );
+    scheduleStatuses = reconciled.statuses;
+    for (const operation of reconciled.activeOperations) {
+      if (!runningProjects.has(operation.project_id)) {
+        markRunning(operation.project_id, operation.mode || "syncing", operation.project);
+      }
+    }
     loaded = true;
+    if (!shownConfigWarnings && cfg.config_warnings.length > 0) {
+      shownConfigWarnings = true;
+      for (const warning of cfg.config_warnings) appendLog(`[config] WARNING: ${warning}`);
+    }
     if (didAutoCheck) return;
     didAutoCheck = true;
-    try {
-      const cfg = await invoke<AppConfig>("get_config");
-      if (cfg.auto_check_on_launch) runCheckAll(true);
-    } catch (_) {}
+    if (cfg.auto_check_on_launch) runCheckAll(true);
   }
 
   /** The log is a live view, not an archive: one push of a source tree emits a
@@ -175,33 +258,30 @@
     appendLog(...lines.map((l) => `[${project}] ${l}`));
   }
 
-  function markRunning(name: string, mode: string) {
+  function markRunning(projectId: string, mode: string, displayName: string) {
     // Drop any snapshot left over from a previous operation on this project
     // before it becomes visible again. Browse's pull emits progress under the
-    // project name without ever going through markDone, so its final snapshot
+    // project ID without ever going through markDone, so its final snapshot
     // could survive and then render as the status of the *next* run for the
     // couple of seconds before a fresh one arrives — or for the whole run, if
     // that run finished first.
-    if (progress.has(name)) {
+    if (progress.has(projectId)) {
       const p = new Map(progress);
-      p.delete(name);
+      p.delete(projectId);
       progress = p;
     }
-    runningProjects = new Map([...runningProjects, [name, mode]]);
+    runningProjects = new Map([...runningProjects, [projectId, mode]]);
+    runningDisplayNames = new Map([...runningDisplayNames, [projectId, displayName]]);
   }
 
-  function markDone(name: string) {
-    const m = new Map(runningProjects);
-    m.delete(name);
-    runningProjects = m;
-    if (progress.has(name)) {
-      const p = new Map(progress);
-      p.delete(name);
-      progress = p;
-    }
-    if (cancellingProjects.has(name)) {
+  function markDone(projectId: string) {
+    const cleared = clearOperationState(runningProjects, runningDisplayNames, progress, projectId);
+    runningProjects = cleared.runningProjects;
+    runningDisplayNames = cleared.runningDisplayNames;
+    progress = cleared.progress;
+    if (cancellingProjects.has(projectId)) {
       const c = new Set(cancellingProjects);
-      c.delete(name);
+      c.delete(projectId);
       cancellingProjects = c;
     }
   }
@@ -216,25 +296,25 @@
    *  grounds for: a stopped push/pull/bisync moved an unknown subset of files,
    *  and a failed operation means the last verdict rested on a run that has
    *  since failed. Leaving the old badge up is the dishonest option. */
-  function noteFailure(name: string, mode: SyncMode, e: unknown, log = true) {
+  function noteFailure(projectId: string, name: string, mode: SyncMode, e: unknown, log = true) {
     if (!isCancelled(e)) {
       // The backend's failure text spans several lines — the exit code and the
       // tail of rclone's own output. Pushing it as one entry made a paragraph
       // pretending to be a log line.
       if (log) addLog(name, `ERROR: ${e}`);
       if (mode === "bisync" && String(e).includes(PRE_APPLY_STOP_MARKER)) {
-        resyncNeeded = new Set([...resyncNeeded, name]);
+        resyncNeeded = new Set([...resyncNeeded, projectId]);
       }
       // Always, even for a silent launch check: the badge on screen was earned
       // by a run that has now failed, so it has to be withdrawn. Suppressing
       // this with the log was how an expired token left a project reading
       // "synced" after the app had just failed to verify it.
-      setStatus(name, "unknown");
+      setStatus(projectId, "unknown");
       return;
     }
     if (log) appendLog(`[${name}] Cancelled.`);
     if (mode === "push" || mode === "pull" || mode === "bisync" || mode === "resync") {
-      setStatus(name, "modified", -1);
+      setStatus(projectId, "modified", -1);
     }
     if (mode === "bisync" && log) {
       appendLog(`[${name}] NOTE: an interrupted bi-sync leaves rclone's listings stale — the next bi-sync will likely need --resync.`);
@@ -242,10 +322,11 @@
   }
 
   async function handleCancel(project: Project) {
-    if (!runningProjects.has(project.name) || cancellingProjects.has(project.name)) return;
-    cancellingProjects = new Set([...cancellingProjects, project.name]);
-    appendLog(`[${project.name}] Stopping ${runningProjects.get(project.name)}...`);
-    await invoke("cancel_op", { projectName: project.name });
+    const projectId = cancelTarget(project, new Set(runningProjects.keys()));
+    if (!projectId || cancellingProjects.has(projectId)) return;
+    cancellingProjects = new Set([...cancellingProjects, projectId]);
+    appendLog(`[${project.name}] Stopping ${runningProjects.get(projectId)}...`);
+    await invoke("cancel_op", { projectId });
   }
 
   /** Stop everything in flight. Deliberately unlabelled with a count: during a
@@ -256,24 +337,23 @@
     // Cancels only the run that is actually in flight — a later run gets its own
     // token and is unaffected.
     if (activeBulk) activeBulk.cancelled = true;
-    const names = [...runningProjects.keys()];
+    const projectIds = [...runningProjects.keys()];
     appendLog("--- CANCEL ALL ---");
-    cancellingProjects = new Set([...cancellingProjects, ...names]);
-    await Promise.all(names.map((n) => invoke("cancel_op", { projectName: n })));
+    cancellingProjects = new Set([...cancellingProjects, ...projectIds]);
+    await Promise.all([
+      ...projectIds.map((projectId) => invoke("cancel_op", { projectId })),
+      invoke("cancel_scheduled_pending"),
+    ]);
+    scheduleStatuses = new Map([...scheduleStatuses].map(([projectId, status]) => [projectId, { ...status, pending: false }]));
   }
 
   function togglePin(project: Project) {
-    const idx = pinnedNames.indexOf(project.name);
-    if (idx >= 0) {
-      pinnedNames = pinnedNames.filter((n) => n !== project.name);
-    } else {
-      pinnedNames = [...pinnedNames, project.name];
-    }
+    pinnedIds = [...toggleProjectId(new Set(pinnedIds), project.id)];
   }
 
   async function handleAction(project: Project, mode: SyncMode) {
-    if (runningProjects.has(project.name)) {
-      appendLog(`[${project.name}] Skipped — ${runningProjects.get(project.name)} already in progress.`);
+    if (runningProjects.has(project.id)) {
+      appendLog(`[${project.name}] Skipped — ${runningProjects.get(project.id)} already in progress.`);
       return;
     }
     if (mode === "pull") {
@@ -312,9 +392,10 @@
       if (!ok) return;
     }
 
-    markRunning(project.name, mode);
+    markRunning(project.id, mode, project.name);
     appendLog(`--- ${mode.toUpperCase()} ${project.name} ---`);
 
+    let retainRunning = false;
     try {
       // Only a check contributes anything to the log at the end: its verdict is
       // built by the backend from output the user never sees. Everything else
@@ -322,30 +403,35 @@
       // it ran — logging it again would print the whole run twice.
       let summary = "";
       if (mode === "push") {
-        await invoke<string>("push", { projectName: project.name, dryRun: false });
+        await invoke<string>("push", { projectName: project.name, projectId: project.id, dryRun: false });
       } else if (mode === "dry-run") {
-        await invoke<string>("push", { projectName: project.name, dryRun: true });
+        await invoke<string>("push", { projectName: project.name, projectId: project.id, dryRun: true });
       } else if (mode === "pull") {
-        await invoke<string>("pull", { projectName: project.name, dryRun: false });
+        await invoke<string>("pull", { projectName: project.name, projectId: project.id, dryRun: false });
       } else if (mode === "bisync") {
-        await invoke<string>("bisync", { projectName: project.name });
+        await invoke<string>("bisync", { projectName: project.name, projectId: project.id });
       } else if (mode === "resync") {
-        await invoke<string>("bisync_resync", { projectName: project.name });
+        await invoke<string>("bisync_resync", { projectName: project.name, projectId: project.id });
       } else if (mode === "check") {
-        const outcome = await invoke<CheckOutcome>("check", { projectName: project.name });
-        applyCheckOutcome(project.name, outcome);
+        const outcome = await invoke<CheckOutcome>("check", { projectName: project.name, projectId: project.id });
+        applyCheckOutcome(project.id, outcome);
         summary = outcome.details;
       }
       if (summary) addLog(project.name, summary);
       appendLog(`[${project.name}] Done.`);
       // After successful push/pull/bisync, mark as synced
       if (mode === "push" || mode === "pull" || mode === "bisync") {
-        setStatus(project.name, "synced");
+        setStatus(project.id, "synced");
       }
     } catch (e) {
-      noteFailure(project.name, mode, e);
+      if (String(e).includes("already running")) {
+        retainRunning = await scheduledOperationActive(project.id);
+        appendLog(`[${project.name}] Skipped — a Scheduled Push is already running.`);
+      } else {
+        noteFailure(project.id, project.name, mode, e);
+      }
     }
-    markDone(project.name);
+    if (!retainRunning) markDone(project.id);
   }
 
   async function handleDelete(project: Project) {
@@ -365,11 +451,31 @@
     if (!really) return;
 
     try {
-      await invoke("delete_local", { projectName: project.name });
+      await invoke("delete_local", { projectName: project.name, projectId: project.id });
       appendLog(`[${project.name}] Local copy deleted.`);
       projects = await invoke<ProjectStatus[]>("get_projects_status");
     } catch (e) {
       addLog(project.name, `DELETE ERROR: ${e}`);
+    }
+  }
+
+  async function handleReattach(project: Project) {
+    const status = projects.find((candidate) => candidate.id === project.id);
+    const target = status?.retired_target ?? `${project.remote}:${project.remote_path}`;
+    const ok = await customConfirm(
+      "Reattach retired remote target?",
+      `${target} was explicitly retired on another device. Reattaching creates a new project identity and lets future Push operations write this local folder to that target. Existing schedules are not restored, and nothing will be pushed now.`,
+      "Reattach",
+      true,
+      "reattach",
+    );
+    if (!ok) return;
+    try {
+      await invoke<string>("reattach_retired_target", { projectName: project.name, projectId: project.id });
+      appendLog(`[${project.name}] Reattached ${target} as a new project generation.`);
+      projects = await invoke<ProjectStatus[]>("get_projects_status");
+    } catch (e) {
+      addLog(project.name, `REATTACH ERROR: ${e}`);
     }
   }
 
@@ -385,37 +491,37 @@
     title: string;
     concurrency: number;
     verb: string;
-    run: (name: string) => Promise<string>;
-    onSuccess: (name: string, result: string, silent: boolean) => void;
+    run: (project: ProjectStatus) => Promise<string>;
+    onSuccess: (projectId: string, name: string, result: string, silent: boolean) => void;
   }> = {
     check: {
       title: "Check all", concurrency: 4, verb: "checked",
-      run: async (name) => {
-        const outcome = await invoke<CheckOutcome>("check", { projectName: name });
-        applyCheckOutcome(name, outcome);
+      run: async (project) => {
+        const outcome = await invoke<CheckOutcome>("check", { projectName: project.name, projectId: project.id });
+        applyCheckOutcome(project.id, outcome);
         return outcome.details;
       },
-      onSuccess(name, details, silent) {
+      onSuccess(_projectId, name, details, silent) {
         if (!silent) addLog(name, details);
       },
     },
     push: {
       title: "Push all", concurrency: 3, verb: "pushed",
-      run: (name) => invoke<string>("push", { projectName: name, dryRun: false }),
-      onSuccess: (name) => noteSuccess(name),
+      run: (project) => invoke<string>("push", { projectName: project.name, projectId: project.id, dryRun: false }),
+      onSuccess: (projectId, name) => noteSuccess(projectId, name),
     },
     bisync: {
       title: "Bi-sync all", concurrency: 3, verb: "bi-synced",
-      run: (name) => invoke<string>("bisync", { projectName: name }),
-      onSuccess: (name) => noteSuccess(name),
+      run: (project) => invoke<string>("bisync", { projectName: project.name, projectId: project.id }),
+      onSuccess: (projectId, name) => noteSuccess(projectId, name),
     },
   };
 
   /** The transfer's own output already streamed into the log as it happened, so
    *  this only marks the end of it. */
-  function noteSuccess(name: string) {
+  function noteSuccess(projectId: string, name: string) {
     appendLog(`[${name}] Done.`);
-    setStatus(name, "synced");
+    setStatus(projectId, "synced");
   }
 
   let activeBulk: { id: number; mode: BulkMode; cancelled: boolean } | null = null;
@@ -436,21 +542,32 @@
 
     const queue = [...localProjects];
     let skipped = 0;
+    let retiredSkipped = 0;
 
     async function one(ps: ProjectStatus) {
+      if ((mode === "push" || mode === "bisync") && ps.retired) {
+        retiredSkipped++;
+        return;
+      }
       // Busy with a manual operation. Counted rather than ignored, so the
       // summary below can never call a run complete that silently passed
       // projects over.
-      if (runningProjects.has(ps.name)) { skipped++; return; }
-      markRunning(ps.name, mode);
-      if (silent) silentProjects.add(ps.name);
+      if (runningProjects.has(ps.id)) { skipped++; return; }
+      markRunning(ps.id, mode, ps.name);
+      if (silent) silentProjects.add(ps.id);
+      let retainRunning = false;
       try {
-        spec.onSuccess(ps.name, await spec.run(ps.name), silent);
+        spec.onSuccess(ps.id, ps.name, await spec.run(ps), silent);
       } catch (e) {
-        noteFailure(ps.name, mode, e, !silent);
+        if (String(e).includes("already running")) {
+          retainRunning = await scheduledOperationActive(ps.id);
+          if (!silent) appendLog(`[${ps.name}] Skipped — a Scheduled Push is already running.`);
+        } else {
+          noteFailure(ps.id, ps.name, mode, e, !silent);
+        }
       }
-      silentProjects.delete(ps.name);
-      markDone(ps.name);
+      silentProjects.delete(ps.id);
+      if (!retainRunning) markDone(ps.id);
     }
 
     try {
@@ -465,6 +582,7 @@
       const notes: string[] = [];
       if (queue.length > 0) notes.push(`${queue.length} not ${spec.verb}`);
       if (skipped > 0) notes.push(`${skipped} skipped (already running)`);
+      if (retiredSkipped > 0) notes.push(`${retiredSkipped} skipped (retired remote target)`);
       const head = run.cancelled ? `${spec.title} cancelled` : `${spec.title} complete`;
       appendLog(notes.length ? `${head} — ${notes.join(", ")}.` : `${head}.`);
     }
@@ -474,9 +592,10 @@
 
   async function handlePushAll() {
     const count = localProjects.length;
+    const retired = localProjects.filter((project) => project.retired).length;
     const ok = await customConfirm(
       `Push All (${count} projects)?`,
-      `This will push all ${count} local projects to their remotes.\nLocal is authoritative — remote files will be overwritten.`,
+      `This will push ${count - retired} local projects to their remotes. ${retired ? `${retired} retired remote target${retired === 1 ? "" : "s"} will be skipped.\n` : ""}Local is authoritative — remote files will be overwritten.`,
       "Push All",
       false,
     );
@@ -565,6 +684,7 @@
       case "h": { const s = ensureSelected(); if (s) handleDelete(toProject(s)); } break;
       case "e": { const s = ensureSelected(); if (s) invoke("open_folder", { localPath: s.local_path }); } break;
       case "i": { const s = ensureSelected(); if (s) togglePin(toProject(s)); } break;
+      case "t": { const s = ensureSelected(); if (s) { scheduleTarget = s.id; scheduleRequest++; } } break;
       case "q": { const s = ensureSelected(); if (s) handleCancel(toProject(s)); } break;
       case "/": e.preventDefault(); filterInput?.focus(); break;
       case "c": if (!bulkMode) runCheckAll(); break;
@@ -573,10 +693,9 @@
       case "x": clearLog(); break;
       case "o": toggleOutput(); break;
       case "b": window.dispatchEvent(new CustomEvent("open-browse")); break;
+      case "m": window.dispatchEvent(new CustomEvent("open-schedules")); break;
     }
   }
-
-  loadProjects();
 
   // Reloading the project list is how App asks for a refresh after Settings or
   // Browse closes. It deliberately does NOT touch runningProjects — an operation
@@ -592,33 +711,58 @@
     // component and the handlers stacked up. `disposed` covers teardown landing
     // before the async registration resolves.
     const unlisten: (() => void)[] = [];
+    const registrations: Promise<() => void>[] = [];
     let disposed = false;
     const track = (p: Promise<() => void>) => {
+      registrations.push(p);
       p.then((fn) => (disposed ? fn() : unlisten.push(fn)));
     };
 
-    track(listen<{ projects: string[] }>("file-change", (event) => {
-      const changed = event.payload.projects;
-      const updated = { ...checkStatuses };
-      for (const name of changed) {
-        if (updated[name]?.state === "synced") {
-          updated[name] = { ...updated[name], state: "modified", diffs: -1 };
-        }
+    track(listen<{ projects: { project_id: string; project: string }[] }>("file-change", (event) => {
+      for (const changed of event.payload.projects) {
+        checkStatuses = markProjectModified(checkStatuses, changed.project_id);
       }
-      checkStatuses = updated;
     }));
 
     // rclone's output as it happens, in batches of whatever arrived together.
-    track(listen<{ project: string; lines: string[] }>("rclone-log", (event) => {
-      const { project, lines } = event.payload;
-      if (silentProjects.has(project)) return;
+    track(listen<{ project_id: string; project: string; lines: string[] }>("rclone-log", (event) => {
+      const { project_id, project, lines } = event.payload;
+      if (silentProjects.has(project_id)) return;
       appendLog(...lines.map((l) => `[${project}] ${l}`));
     }));
 
-    track(listen<{ project: string; text: string }>("rclone-progress", (event) => {
-      const { project, text } = event.payload;
-      progress = new Map([...progress, [project, text]]);
+    track(listen<{ project_id: string; project: string; text: string }>("rclone-progress", (event) => {
+      const { project_id, text } = event.payload;
+      progress = new Map([...progress, [project_id, text]]);
     }));
+
+    track(listen<ScheduledPushEvent>("scheduled-push-event", (event) => {
+      const { project_id, project, phase, error } = event.payload;
+      if (phase === "started") {
+        markRunning(project_id, "push", project);
+        noteScheduledState(project_id, { pending: false, running: true, scheduled_running: true, terminal: false }, phase);
+        appendLog(`[${project}] Scheduled Push started.`);
+      } else if (phase === "deferred") {
+        noteScheduledState(project_id, { pending: true }, phase);
+      } else {
+        markDone(project_id);
+        noteScheduledState(project_id, { pending: false, running: false, scheduled_running: false, terminal: true }, phase);
+        if (phase === "succeeded") {
+          appendLog(`[${project}] Scheduled Push done.`);
+          setStatus(project_id, "synced");
+        } else if (phase === "cancelled") {
+          noteFailure(project_id, project, "push", "CANCELLED");
+        } else {
+          noteFailure(project_id, project, "push", error ?? "Scheduled Push failed");
+        }
+      }
+    }));
+
+    // Subscribe before the snapshot so a scheduled operation that began before
+    // the WebView existed is still reconstructed without missing its terminal event.
+    Promise.all(registrations).then(() => {
+      if (!disposed) loadProjects().catch((error) => appendLog(`[config] ERROR loading projects: ${error}`));
+    }).catch((error) => appendLog(`[config] ERROR registering events: ${error}`));
 
     return () => {
       disposed = true;
@@ -677,21 +821,26 @@
       {:else if filteredProjects.length === 0}
         <p class="loading">No matches for "{search}"</p>
       {:else}
-        {#each filteredProjects as project, i (project.name)}
+        {#each filteredProjects as project, i (project.id)}
           <div class="card-wrapper" class:selected={i === selectedIndex} onclick={() => selectedIndex = i}>
             <ProjectCard
               project={toProject(project)}
-              running={runningProjects.has(project.name)}
-              runningMode={runningProjects.get(project.name) ?? ""}
-              cancelling={cancellingProjects.has(project.name)}
-              checkStatus={checkStatuses[project.name] ?? null}
-              pinned={pinnedNames.includes(project.name)}
+              running={runningProjects.has(project.id)}
+              runningMode={runningProjects.get(project.id) ?? ""}
+              cancelling={cancellingProjects.has(project.id)}
+              checkStatus={checkStatuses.get(project.id) ?? null}
+              pinned={pinnedIds.includes(project.id)}
               onaction={handleAction}
               oncancel={handleCancel}
               ondelete={handleDelete}
+              onreattach={handleReattach}
               onpin={togglePin}
               onupdated={loadProjects}
-              needsResync={resyncNeeded.has(project.name)}
+              needsResync={resyncNeeded.has(project.id)}
+              scheduleStatus={scheduleStatuses.get(project.id) ?? null}
+              scheduleRequest={scheduleTarget === project.id ? scheduleRequest : 0}
+              retired={project.retired}
+              retiredTarget={project.retired_target}
             />
           </div>
         {/each}
@@ -702,10 +851,10 @@
          exactly what you want when you have hidden the log. -->
     {#if activeProgress.length > 0}
       <div class="progress-strip">
-        {#each activeProgress as [name, text] (name)}
+        {#each activeProgress as item (item.projectId)}
           <div class="progress-row">
-            <span class="progress-name">{name}</span>
-            <span class="progress-text">{text}</span>
+            <span class="progress-name">{item.name}</span>
+            <span class="progress-text">{item.text}</span>
           </div>
         {/each}
       </div>
