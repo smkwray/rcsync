@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoh-at/tauri-v2-schema/refs/heads/main/tauri.conf.schema.json",
   "productName": "rcsync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.rcsync.dev",
   "build": {
     "frontendDist": "../dist",
