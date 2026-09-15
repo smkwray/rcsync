@@ -26,6 +26,8 @@ do/
 CLAUDE.md
 AGENTS.md
 scripts/
+!scripts/
+!scripts/privacy_gate.py
 .githooks/
 
 # Syncthing artifacts (this tree is synced between machines)
