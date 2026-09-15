@@ -37,6 +37,8 @@ docs/
 
 # Environment
 .env
+.private-denylist
+.worktrees/
 
 # Plans
 *.plan.md
