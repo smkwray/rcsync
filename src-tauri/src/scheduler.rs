@@ -757,6 +757,10 @@ mod tests {
 
     #[test]
     fn busy_project_keeps_one_pending_occurrence_until_free() {
+        // reconcile_state persists schedule history. Without this, the write goes to
+        // whatever data dir the process currently names: the user's real one, or a
+        // temp dir another test is deleting, which fails the write and empties the result.
+        let _env = crate::config::TestConfigEnv::new("busy-project-keeps-one-pending-occurrenc");
         let now = Local
             .with_ymd_and_hms(2026, 8, 29, 12, 0, 0)
             .single()
@@ -792,6 +796,10 @@ mod tests {
 
     #[test]
     fn disabling_or_changing_a_schedule_drops_old_pending_work() {
+        // reconcile_state persists schedule history. Without this, the write goes to
+        // whatever data dir the process currently names: the user's real one, or a
+        // temp dir another test is deleting, which fails the write and empties the result.
+        let _env = crate::config::TestConfigEnv::new("disabling-or-changing-a-schedule-drops-o");
         let now = Local
             .with_ymd_and_hms(2026, 8, 29, 12, 0, 0)
             .single()
@@ -883,6 +891,10 @@ mod tests {
 
     #[test]
     fn a_busy_multi_occurrence_ticket_records_the_latest_due() {
+        // reconcile_state persists schedule history. Without this, the write goes to
+        // whatever data dir the process currently names: the user's real one, or a
+        // temp dir another test is deleting, which fails the write and empties the result.
+        let _env = crate::config::TestConfigEnv::new("a-busy-multi-occurrence-ticket-records-t");
         let now = Local
             .with_ymd_and_hms(2026, 8, 29, 12, 0, 0)
             .single()
@@ -1157,6 +1169,10 @@ mod tests {
 
     #[test]
     fn startup_replays_one_coalesced_stale_occurrence() {
+        // reconcile_state persists schedule history. Without this, the write goes to
+        // whatever data dir the process currently names: the user's real one, or a
+        // temp dir another test is deleting, which fails the write and empties the result.
+        let _env = crate::config::TestConfigEnv::new("startup-replays-one-coalesced-stale-occu");
         let now = Local
             .with_ymd_and_hms(2026, 8, 29, 12, 0, 0)
             .single()
