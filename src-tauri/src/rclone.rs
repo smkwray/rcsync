@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
+use crate::watchdog::{self, RunMonitor, StallLimits};
+
 /// Error text returned when the user stops an operation. Exact string, matched
 /// by the frontend so a cancel reads as a cancel and not as a sync failure.
 pub const CANCELLED: &str = "CANCELLED";
@@ -454,6 +456,9 @@ struct StderrRouter {
     /// Set when rclone reported one of its pre-apply safety stops. Derived from
     /// the structured record, not from `text`.
     pre_apply_stop: bool,
+    /// Sees every raw line before it is rendered, so progress is judged from
+    /// rclone's own counters rather than from the display strings.
+    monitor: Option<Arc<RunMonitor>>,
 }
 
 impl StderrRouter {
@@ -462,10 +467,19 @@ impl StderrRouter {
             live: LiveLog::new(project_id, project),
             text: String::new(),
             pre_apply_stop: false,
+            monitor: None,
         }
     }
 
+    fn with_monitor(mut self, monitor: Arc<RunMonitor>) -> Self {
+        self.monitor = Some(monitor);
+        self
+    }
+
     fn line(&mut self, raw: &str) {
+        if let Some(monitor) = &self.monitor {
+            monitor.on_stderr_line(raw, Instant::now());
+        }
         let (rendered, pre_apply_stop) = render_log_line(raw);
         self.pre_apply_stop |= pre_apply_stop;
         match rendered {
@@ -778,6 +792,9 @@ struct RcloneRun {
     output: String,
     code: i32,
     pre_apply_stop: bool,
+    /// Why the watchdog stopped this run, when it did. Such a run always has a
+    /// non-zero `code`, whatever rclone's own exit status was.
+    stalled: Option<String>,
 }
 
 fn run_rclone(
@@ -794,6 +811,7 @@ fn run_rclone(
         SharedChild::spawn(&mut cmd)
             .map_err(|e| format!("Failed to start rclone at '{}': {}", rclone, e))?,
     );
+    let monitor = RunMonitor::new(project_id, args);
 
     // Drain both pipes on their own threads. `-v` produces more than a pipe
     // buffer holds, and rclone blocks forever on a full pipe — so reading them
@@ -817,10 +835,12 @@ fn run_rclone(
     });
     let err_reader = std::thread::spawn({
         let stderr = child.take_stderr();
+        let monitor = monitor.clone();
         let project_id = project_id.to_string();
         let display_name = display_name.to_string();
         move || -> Result<(String, bool), String> {
-            let mut router = StderrRouter::new(&project_id, &display_name);
+            let mut router =
+                StderrRouter::new(&project_id, &display_name).with_monitor(monitor.clone());
             let read = drain(stderr, "stderr", &mut |raw| router.line(raw));
             // Finish either way: a read that failed partway still produced lines
             // the user should see.
@@ -842,7 +862,18 @@ fn run_rclone(
         let _ = child.kill();
     }
 
+    // A child that stays alive but stops making progress would otherwise hold
+    // this thread, and with it the scheduled-Push queue, for as long as it lives.
+    // Only the operations the watchdog has a model for are supervised.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = StallLimits::for_args(args).map(|limits| {
+        let (child, monitor) = (child.clone(), monitor.clone());
+        std::thread::spawn(move || watchdog::watch(child, monitor, limits, done_rx))
+    });
+
     let status = child.wait();
+    drop(done_tx);
+    let stalled = watchdog.and_then(|w| w.join().unwrap_or(None));
     ops().running.remove(project_id);
 
     // Join both before deciding anything, so neither thread is left detached.
@@ -877,7 +908,7 @@ fn run_rclone(
     // signal came from outside: a `kill`, a crash, a machine going to sleep.
     // Reporting the bare `-1` that stands in for "no code" reads as an rclone
     // failure and sends the next hour of debugging in the wrong direction.
-    let code = match status.code() {
+    let mut code = match status.code() {
         Some(c) => c,
         None => {
             result.push_str(&format!(
@@ -887,10 +918,30 @@ fn run_rclone(
             -1
         }
     };
+    // A run we stopped never reads as a success, whatever status the signal
+    // left behind: rclone can exit 0 on an interrupt it chose to honour.
+    if let Some(reason) = &stalled {
+        result.push_str(&format!(
+            "rcsync stopped rclone because it stalled: {}.\n",
+            reason
+        ));
+        code = -1;
+    }
+    // Only a run that went wrong needs pointing at its record; a clean run's
+    // output stays exactly what rclone printed.
+    if code != 0 {
+        if let Some(path) = monitor.log_path() {
+            result.push_str(&format!("Raw run record: {}\n", path.display()));
+        }
+    }
+    monitor.note(serde_json::json!({
+        "rcsync": "run-end", "code": code, "stalled": stalled,
+    }));
     Ok(RcloneRun {
         output: result,
         code,
         pre_apply_stop,
+        stalled,
     })
 }
 
@@ -1031,6 +1082,15 @@ fn sync_argv(
     Ok(args)
 }
 
+/// A stalled Push is stopped and tried once more, so one wedged child costs the
+/// stall limit rather than the queue. Never more: a second stall is a real
+/// problem to look at, not something to loop on.
+///
+/// Push only. A Pull deletes local files to match the remote, and nothing
+/// re-checks the remote before an automatic second attempt minutes later, so a
+/// stalled Pull fails and waits for the user to start it again.
+const PUSH_STALL_ATTEMPTS: usize = 2;
+
 pub fn sync_project(
     cfg: &AppConfig,
     project: &Project,
@@ -1043,20 +1103,42 @@ pub fn sync_project(
         check_local_path(project)?
     };
     let remote = cfg.remote_path_for_project(project);
+    let mut stalls: Vec<String> = Vec::new();
+    let attempts = if mode == "push" { PUSH_STALL_ATTEMPTS } else { 1 };
 
-    if mode == "push" && !dry_run {
-        cfg.ensure_remote_target_writable(project)?;
-        ensure_source_not_empty(cfg, project, &local, "push")?;
+    for attempt in 1..=attempts {
+        if attempt > 1 {
+            check_cancelled(&project.id)?;
+        }
+        // Per attempt, not once: the source can empty during a stall's minutes,
+        // and `sync` deletes whatever the source no longer has.
+        if mode == "push" && !dry_run {
+            cfg.ensure_remote_target_writable(project)?;
+            ensure_source_not_empty(cfg, project, &local, "push")?;
+        }
+
+        let args = sync_argv(cfg, project, mode, &local, &remote, dry_run)?;
+        let run = run_rclone(cfg, &project.id, &project.name, &args)?;
+        if let Some(reason) = run.stalled.clone() {
+            stalls.push(format!("attempt {attempt}: {reason}"));
+            continue;
+        }
+        return if run.code == 0 {
+            // A recovered stall is reported, not hidden in a clean result.
+            let notice: String = stalls
+                .iter()
+                .map(|s| format!("rcsync stopped a stalled rclone and retried ({s}).\n"))
+                .collect();
+            Ok(format!("{notice}{}", run.output))
+        } else {
+            Err(failure_message(run.code, &run.output))
+        };
     }
-
-    let args = sync_argv(cfg, project, mode, &local, &remote, dry_run)?;
-
-    let run = run_rclone(cfg, &project.id, &project.name, &args)?;
-    if run.code == 0 {
-        Ok(run.output)
-    } else {
-        Err(failure_message(run.code, &run.output))
-    }
+    Err(format!(
+        "rclone stalled and was stopped ({}):\n{}",
+        if attempts > 1 { format!("all {attempts} attempts") } else { "not retried".to_string() },
+        stalls.join("\n")
+    ))
 }
 
 /// The filter set as an rclone filters file, one `- pattern` line per exclude.
@@ -1450,16 +1532,17 @@ pub fn list_remote(cfg: &AppConfig, remote_name: Option<&str>) -> Result<Vec<Rem
         rc.name,
         config::AppConfig::canonical_remote_path(&rc.base_path)
     );
-    let output = rclone_command(&rclone)
-        .args([
+    let output = watchdog::output_within(
+        rclone_command(&rclone).args([
             "lsjson",
             &list_target,
             "--dirs-only",
             "--no-modtime",
             "--no-mimetype",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run rclone lsjson: {e}"))?;
+        ]),
+        watchdog::list_deadline(),
+    )
+    .map_err(|e| format!("rclone lsjson {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1712,6 +1795,287 @@ mod cancel_tests {
             }),
             "the original claim remains identifiable by ID until its guard drops"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stall_tests {
+    //! The watchdog as production wires it: `run_rclone` and `sync_project`
+    //! driving a stand-in rclone, with the limits shrunk from minutes to
+    //! milliseconds. A unit test of the progress arithmetic cannot show that the
+    //! runner consults it, stops the child, or refuses to call a stopped run a
+    //! success — these do, and each fails if that wiring is removed.
+    use super::*;
+    use crate::watchdog::TEST_LIMITS;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn limits(no_progress_ms: u64) -> StallLimits {
+        StallLimits {
+            no_signal: Duration::from_millis(no_progress_ms),
+            no_progress: Duration::from_millis(no_progress_ms),
+            output_counts: false,
+            grace: Duration::from_millis(300),
+            tick: Duration::from_millis(20),
+        }
+    }
+
+    /// Resets on drop, so a failing assertion cannot leave shrunken limits set
+    /// for every later test on the same thread and bury the real failure.
+    struct LimitsGuard;
+    impl Drop for LimitsGuard {
+        fn drop(&mut self) {
+            TEST_LIMITS.with(|c| c.set(None));
+        }
+    }
+
+    fn with_limits<T>(l: StallLimits, f: impl FnOnce() -> T) -> T {
+        TEST_LIMITS.with(|c| c.set(Some(l)));
+        let _reset = LimitsGuard;
+        f()
+    }
+
+    fn sh_cfg() -> AppConfig {
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = "/bin/sh".into();
+        cfg
+    }
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".into(), script.into()]
+    }
+
+    /// One stats heartbeat as a shell command. Double-quoted so `$i` expands: a
+    /// single-quoted record is invalid JSON, and the watchdog (correctly) reads
+    /// that as "no progress record" — which once made these tests vacuous.
+    fn stats(listed: &str, extra: &str) -> String {
+        format!(
+            r#"echo "{{\"level\":\"notice\",\"msg\":\"x\",\"stats\":{{\"listed\":{listed}{extra}}}}}" >&2"#
+        )
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rcsync-stall-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_child_that_stops_making_progress_is_stopped_and_never_reads_as_success() {
+        let id = "stall-hang";
+        let _op = start_op(id).unwrap();
+        let started = Instant::now();
+        let run = with_limits(limits(300), || {
+            run_rclone(&sh_cfg(), id, id, &sh(&format!("{}; exec sleep 30", stats("1", ""))))
+        })
+        .unwrap();
+        assert!(run.stalled.is_some(), "the hang must be detected");
+        assert_eq!(run.code, -1, "a stopped run must not carry a success code");
+        assert!(run.output.contains("stalled"), "{}", run.output);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stall must end the wait, not outlast the child"
+        );
+    }
+
+    #[test]
+    fn a_stopped_child_that_exits_zero_on_the_signal_still_fails() {
+        // rclone can exit 0 on an interrupt it chooses to honour.
+        let id = "stall-exit-zero";
+        let _op = start_op(id).unwrap();
+        let script = format!("trap 'exit 0' TERM; {}; while :; do sleep 0.05; done", stats("1", ""));
+        let run = with_limits(limits(300), || run_rclone(&sh_cfg(), id, id, &sh(&script))).unwrap();
+        assert!(run.stalled.is_some());
+        assert_eq!(run.code, -1, "exit 0 from a run we stopped must not read as success");
+    }
+
+    #[test]
+    fn a_growing_listing_is_not_a_stall() {
+        let id = "stall-listing";
+        let _op = start_op(id).unwrap();
+        // 1.5 s of steadily increasing `listed` against a 400 ms limit.
+        let script = format!(
+            "i=0; while [ $i -lt 30 ]; do i=$((i+1)); {}; sleep 0.05; done",
+            stats("$i", "")
+        );
+        let run = with_limits(limits(400), || run_rclone(&sh_cfg(), id, id, &sh(&script))).unwrap();
+        assert!(run.stalled.is_none(), "{:?}", run.stalled);
+        assert_eq!(run.code, 0);
+    }
+
+    #[test]
+    fn heartbeats_that_only_advance_the_clock_are_a_stall() {
+        let id = "stall-ticking";
+        let _op = start_op(id).unwrap();
+        // Constant counters, `elapsedTime` rising: a child that only ticks.
+        let script = format!(
+            "i=0; while [ $i -lt 60 ]; do i=$((i+1)); {}; sleep 0.05; done",
+            stats("5", r#",\"elapsedTime\":$i"#)
+        );
+        let run = with_limits(limits(400), || run_rclone(&sh_cfg(), id, id, &sh(&script))).unwrap();
+        assert!(run.stalled.is_some(), "ticking alone must not keep a run alive");
+    }
+
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_after_the_grace() {
+        let id = "stall-ignores-term";
+        let _op = start_op(id).unwrap();
+        let started = Instant::now();
+        let script = format!("trap '' TERM; {}; exec sleep 30", stats("1", ""));
+        let run = with_limits(limits(300), || run_rclone(&sh_cfg(), id, id, &sh(&script))).unwrap();
+        assert!(run.stalled.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "escalation to SIGKILL must end a child that ignores SIGTERM"
+        );
+    }
+
+    /// A stand-in rclone: answers the empty-source probe, counts how often it is
+    /// asked, and hangs on the first `sync` (or on every one).
+    fn fake_rclone(dir: &std::path::Path, hang_every_time: bool, empty_after_first_probe: bool) -> String {
+        let script = format!(
+            r#"#!/bin/sh
+d="{d}"
+case "$1" in
+  size) echo x >> "$d/size-calls"
+        n=$(wc -l < "$d/size-calls")
+        if [ "{empty}" = "1" ] && [ "$n" -ge 2 ]; then echo '{{"count":0,"bytes":0}}'
+        else echo '{{"count":3,"bytes":3}}'; fi ;;
+  sync) echo x >> "$d/sync-calls"
+        if [ "{always}" = "1" ] || [ ! -f "$d/hung-once" ]; then
+          touch "$d/hung-once"; {stats}; exec sleep 30
+        fi
+        echo synced ;;
+esac
+"#,
+            d = dir.display(),
+            always = if hang_every_time { "1" } else { "0" },
+            empty = if empty_after_first_probe { "1" } else { "0" },
+            stats = stats("1", ""),
+        );
+        let path = dir.join("fake-rclone");
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn project(id: &str, dir: &std::path::Path) -> Project {
+        Project {
+            id: id.into(),
+            name: id.into(),
+            local_path: dir.to_string_lossy().into_owned(),
+            remote_path: format!("proj/{id}"),
+            remote: "gdrive".into(),
+            excludes: vec![],
+            schedule: None,
+            schedule_error: None,
+            legacy_schedule: None,
+            legacy_schedule_raw: None,
+        }
+    }
+
+    fn calls(dir: &std::path::Path, name: &str) -> usize {
+        fs::read_to_string(dir.join(name)).map(|t| t.lines().count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_stalled_push_is_retried_once_and_the_source_guard_runs_again() {
+        let id = "stall-push-retry";
+        let dir = scratch("retry");
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = fake_rclone(&dir, false, false);
+        let project = project(id, &dir);
+        let _op = start_op(id).unwrap();
+
+        let out = with_limits(limits(300), || sync_project(&cfg, &project, "push", false));
+        let (probes, syncs) = (calls(&dir, "size-calls"), calls(&dir, "sync-calls"));
+        fs::remove_dir_all(&dir).unwrap();
+
+        let out = out.expect("the second attempt succeeds");
+        assert!(out.contains("retried"), "a recovered stall must be reported:\n{out}");
+        assert_eq!(syncs, 2, "the stalled sync is tried exactly once more");
+        assert_eq!(
+            probes, 2,
+            "each attempt must re-check the source: it can empty during a stall, and sync deletes"
+        );
+    }
+
+    #[test]
+    fn a_stalled_pull_runs_sync_once_and_is_not_retried() {
+        // A Pull makes the local tree match the remote. Nothing re-checks the
+        // remote before an automatic second attempt minutes later, so it must
+        // wait for the user instead.
+        let id = "stall-pull-once";
+        let dir = scratch("pull");
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = fake_rclone(&dir, false, false);
+        let project = project(id, &dir);
+        let _op = start_op(id).unwrap();
+
+        let err = with_limits(limits(300), || sync_project(&cfg, &project, "pull", false));
+        let syncs = calls(&dir, "sync-calls");
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = err.expect_err("a stalled Pull is a failure");
+        assert!(err.contains("not retried"), "{err}");
+        assert_eq!(syncs, 1, "a stalled Pull must never be run a second time automatically");
+    }
+
+    #[test]
+    fn a_second_probe_that_finds_the_source_empty_prevents_the_retry() {
+        let id = "stall-push-emptied";
+        let dir = scratch("emptied");
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = fake_rclone(&dir, false, true);
+        let project = project(id, &dir);
+        let _op = start_op(id).unwrap();
+
+        let err = with_limits(limits(300), || sync_project(&cfg, &project, "push", false));
+        let syncs = calls(&dir, "sync-calls");
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = err.expect_err("an emptied source must stop the retry");
+        assert!(err.contains("Refusing to push"), "{err}");
+        assert_eq!(syncs, 1, "the second sync must never start against an empty source");
+    }
+
+    #[test]
+    fn list_remote_stops_a_hung_lsjson_at_the_production_call_site() {
+        let dir = scratch("list");
+        let fake = dir.join("fake-rclone");
+        fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = fake.to_string_lossy().into_owned();
+
+        crate::watchdog::TEST_LIST_DEADLINE.with(|c| c.set(Some(Duration::from_millis(300))));
+        let started = Instant::now();
+        let result = list_remote(&cfg, None);
+        crate::watchdog::TEST_LIST_DEADLINE.with(|c| c.set(None));
+        fs::remove_dir_all(&dir).unwrap();
+
+        let Err(err) = result else { panic!("a hung listing must not hang the Browse view") };
+        assert!(err.contains("was stopped"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the deadline must end the wait");
+    }
+
+    #[test]
+    fn a_push_that_stalls_every_time_fails_after_two_attempts() {
+        let id = "stall-push-twice";
+        let dir = scratch("twice");
+        let mut cfg = super::tests::test_cfg(vec![]);
+        cfg.rclone_path = fake_rclone(&dir, true, false);
+        let project = project(id, &dir);
+        let _op = start_op(id).unwrap();
+
+        let err = with_limits(limits(300), || sync_project(&cfg, &project, "push", false));
+        let syncs = calls(&dir, "sync-calls");
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = err.expect_err("two stalls are a failure, never a success");
+        assert!(err.contains("all 2 attempts"), "{err}");
+        assert_eq!(syncs, 2, "never a third attempt");
     }
 }
 

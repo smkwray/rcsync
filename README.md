@@ -293,6 +293,26 @@ Toggle with the **Keys** checkbox or **Cmd+K**.
 
 All operations respect the configured exclude patterns.
 
+### Stalled runs
+
+rclone's own timeouts do not catch a process that stays alive but stops working, and one such
+process held the scheduled-Push queue for 23 hours. rcsync supervises `sync` (Push, Pull, Dry Run)
+and the empty-source `size` probe. For a sync it watches rclone's progress counters (bytes, files,
+checks, objects listed, deletes, renames, in-flight transfer bytes) and stops the run when none has
+changed for 30 minutes, or when no progress record has arrived within 10 minutes of starting. The
+`size` probe is stopped after 30 minutes of silence. Stopping sends SIGTERM, then SIGKILL after 15
+seconds (Windows terminates the process). A stopped run is reported as failed, never as a success.
+
+A stalled Push is retried once, after checking again that the source is not empty. A stalled Pull is
+not retried: it deletes local files to match the remote, so it waits for you to start it again.
+Bi-Sync and Check are not supervised, because a fixed timer has no model for a long check or for
+bisync saving its state; Cancel still works on them. The 30 minutes is a conservative heuristic, not
+a promise that a healthy but unusually quiet run is never stopped.
+
+Each rclone run's raw log is kept under `rcsync/run-logs/` in the per-user config
+directory (newest 20 per project, 16 MiB each) so the cause of a failure survives a restart. These
+records include local file paths. The Browse remote listing has its own 5-minute limit.
+
 ## License
 
 MIT

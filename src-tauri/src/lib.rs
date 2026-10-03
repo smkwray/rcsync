@@ -2,6 +2,7 @@ mod config;
 mod instance_lock;
 mod rclone;
 mod scheduler;
+mod watchdog;
 mod watcher;
 
 use config::{expand_tilde, load_config, AppConfig, Project, RemoteConfig, Schedule};
