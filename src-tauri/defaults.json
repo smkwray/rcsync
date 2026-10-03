@@ -6,6 +6,7 @@
     ".venv*/**",
     ".tmp-validate-venv/**",
     "src-tauri/target/**",
+    ".cache/**",
     "__pycache__/**",
     ".pytest_cache/**",
     ".mypy_cache/**",

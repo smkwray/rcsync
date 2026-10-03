@@ -3336,6 +3336,28 @@ esac
         fs::write(dir.join("quarantined-data/records.csv"), "x").unwrap();
         // Must NOT be excluded: a file, not a virtualenv directory.
         fs::write(dir.join(".venv-notes.md"), "x").unwrap();
+        // Must be excluded: a directory named exactly `.cache`, at the root or
+        // nested. `**/.cache/**` would also do here; the point is that the
+        // conventional dot-directory is covered at any depth.
+        fs::create_dir_all(dir.join(".cache")).unwrap();
+        fs::write(dir.join(".cache/blob"), "x").unwrap();
+        fs::create_dir_all(dir.join("nested/.cache")).unwrap();
+        fs::write(dir.join("nested/.cache/blob"), "x").unwrap();
+        // Must NOT be excluded: a directory named plain `cache` is not reliably
+        // disposable (`data/cache/` can hold authoritative inputs), and a shipped
+        // default cannot be removed by a user, so excluding it would silently
+        // stop backing those files up while Check still reads as in sync. A user
+        // who wants it excluded adds `cache/**` to `extra_excludes`.
+        fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::write(dir.join("cache/blob"), "x").unwrap();
+        fs::create_dir_all(dir.join("data/cache")).unwrap();
+        fs::write(dir.join("data/cache/series.csv"), "x").unwrap();
+        // Also kept: a name that merely contains "cache".
+        fs::create_dir_all(dir.join("cached-data")).unwrap();
+        fs::write(dir.join("cached-data/records.csv"), "x").unwrap();
+        fs::write(dir.join("cache-notes.md"), "x").unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/cache.py"), "x").unwrap();
 
         let cfg = test_cfg(defaults.iter().map(String::as_str).collect());
         let kept = rclone_source_file_count(&cfg, &project_with(vec![]), dir.to_str().unwrap());
@@ -3347,7 +3369,7 @@ esac
         let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
 
         fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(kept.unwrap(), 2, "kept the wrong set:\n{}", listed);
+        assert_eq!(kept.unwrap(), 7, "kept the wrong set:\n{}", listed);
         assert!(
             !listed.contains(".venv314"),
             "a virtualenv must be excluded:\n{}",
@@ -3362,6 +3384,23 @@ esac
         assert!(
             listed.contains(".venv-notes.md"),
             "a file is not a virtualenv:\n{}",
+            listed
+        );
+        assert!(
+            !listed.contains(".cache/"),
+            "a `.cache` directory must be excluded at any depth:\n{}",
+            listed
+        );
+        assert!(
+            listed.contains("cache/blob") && listed.contains("data/cache/series.csv"),
+            "a plain `cache` directory is not a shipped default and must survive:\n{}",
+            listed
+        );
+        assert!(
+            listed.contains("cached-data/records.csv")
+                && listed.contains("cache-notes.md")
+                && listed.contains("src/cache.py"),
+            "a name that merely contains 'cache' must survive:\n{}",
             listed
         );
     }

@@ -135,6 +135,7 @@ Contains exclude patterns and default scan directories. Safe to check into versi
   "excludes": [
     "node_modules/**", ".git/**", ".worktrees/**",
     ".venv*/**", ".tmp-validate-venv/**", "src-tauri/target/**",
+    ".cache/**",
     "__pycache__/**", ".pytest_cache/**", ".mypy_cache/**", ".ruff_cache/**",
     ".DS_Store", "._*", "Thumbs.db", "desktop.ini"
   ],
