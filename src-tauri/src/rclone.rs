@@ -2100,6 +2100,8 @@ mod tests {
         base
     }
 
+    // Used only by unix-gated tests.
+    #[cfg(unix)]
     fn tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
         fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
             let mut entries: Vec<_> = fs::read_dir(dir)

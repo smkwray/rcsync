@@ -66,6 +66,8 @@ pub fn acquire(path: &Path) -> Result<InstanceLock, String> {
 
 #[cfg(test)]
 mod tests {
+    // Only the unix-gated test below uses the parent's items.
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]
