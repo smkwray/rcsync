@@ -192,7 +192,10 @@ a new project identity and does not restore an old schedule or start a Push.
 
 A schedule runs only while rcsync is open. If the app is reopened after a due
 time, one stale Push is queued for each affected project; repeated missed
-occurrences coalesce into that one Push. The Schedule Manager defaults new
+occurrences coalesce into that one Push. A scheduled Push that was still queued,
+or was interrupted by quitting the app, counts as missed. A failed scheduled Push
+is retried once an hour later; if that also fails, it waits for the next due time.
+The Schedule Manager defaults new
 schedules to 24 hours and provides 12-, 24-, and 48-hour one-click presets.
 With **Queue scheduled pushes** enabled, scheduled Pushes run one at a time and
 due projects wait their turn. Push remains local-authoritative and can remove
