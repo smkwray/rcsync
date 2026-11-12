@@ -1931,6 +1931,81 @@ mod stall_tests {
         );
     }
 
+    /// More stderr than one run record holds, as heartbeats whose `listed`
+    /// keeps rising so the watchdog sees progress throughout. Each line is
+    /// longer than 40 bytes, so the total passes the production cap.
+    fn overflow_the_record() -> String {
+        let lines = crate::watchdog::RUN_LOG_MAX_BYTES / 40;
+        format!(
+            r#"awk 'BEGIN {{ for (i = 0; i < {lines}; i++) printf "{{\"level\":\"notice\",\"msg\":\"x\",\"stats\":{{\"listed\":%d}}}}\n", i > "/dev/stderr" }}'"#
+        )
+    }
+
+    /// The record a failed run points at, read and then removed.
+    fn take_record(run: &RcloneRun) -> Vec<String> {
+        let path = run
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("Raw run record: "))
+            .unwrap_or_else(|| panic!("a failed run must name its record: {}", run.output));
+        let text = fs::read_to_string(path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(
+            text.len() <= crate::watchdog::RUN_LOG_MAX_BYTES + 4096,
+            "rclone output must stay capped: {} bytes",
+            text.len()
+        );
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// The runs that fill a record are the long ones whose outcome matters
+    /// most; a record that loses its ending cannot tell success from failure.
+    #[test]
+    fn a_run_that_overflows_its_record_still_records_its_exit_code() {
+        let id = "record-overflow-exit";
+        let _op = start_op(id).unwrap();
+        let script = format!("{}; exit 3", overflow_the_record());
+        let run = run_rclone(&sh_cfg(), id, id, &sh(&script)).unwrap();
+        assert_eq!(run.code, 3);
+        let lines = take_record(&run);
+        assert!(
+            lines.iter().any(|l| l.contains("log-truncated")),
+            "the flood must reach the cap"
+        );
+        let end: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(
+            end["rcsync"], "run-end",
+            "the record must end with the outcome"
+        );
+        assert_eq!(end["code"], 3);
+    }
+
+    #[test]
+    fn a_stall_after_the_record_is_full_is_still_recorded() {
+        let id = "record-overflow-stall";
+        let _op = start_op(id).unwrap();
+        let script = format!("{}; exec sleep 30", overflow_the_record());
+        let run =
+            with_limits(limits(1500), || run_rclone(&sh_cfg(), id, id, &sh(&script))).unwrap();
+        assert!(
+            run.stalled.is_some(),
+            "the hang after the flood must be detected"
+        );
+        let lines = take_record(&run);
+        let truncated = lines
+            .iter()
+            .position(|l| l.contains("log-truncated"))
+            .expect("cap reached");
+        let stall = lines
+            .iter()
+            .position(|l| l.contains(r#""rcsync":"stall""#))
+            .expect("stall recorded");
+        assert!(stall > truncated, "the stall happened after the flood");
+        let end: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(end["rcsync"], "run-end");
+        assert_eq!(end["code"], -1);
+    }
+
     /// A stand-in rclone: answers the empty-source probe, counts how often it is
     /// asked, and hangs on the first `sync` (or on every one).
     fn fake_rclone(dir: &std::path::Path, hang_every_time: bool, empty_after_first_probe: bool) -> String {

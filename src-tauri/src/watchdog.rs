@@ -57,7 +57,7 @@ const TERM_GRACE: Duration = Duration::from_secs(15);
 
 /// Bounds on a retained run record.
 const RUN_LOG_KEEP: usize = 20;
-const RUN_LOG_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const RUN_LOG_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long `lsjson` may take before it is stopped. It lists one directory level.
 const LIST_DEADLINE: Duration = Duration::from_secs(5 * 60);
@@ -202,8 +202,12 @@ impl RunMonitor {
         c.last_output = now;
     }
 
+    /// rcsync's own record of the run (why it was stopped, how it ended). It
+    /// bypasses the byte cap, which bounds rclone's output only.
     pub fn note(&self, event: Value) {
-        self.write_raw(&event.to_string());
+        if let Some(log) = self.log.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            log.write_record(&event.to_string());
+        }
     }
 
     fn write_raw(&self, line: &str) {
@@ -244,7 +248,9 @@ fn human(d: Duration) -> String {
 
 /// Raw stderr of one run, newest 20 per project, each capped. The UI log dies
 /// with the app and holds only a rendered view; the cause of a hang is in the
-/// last records before it, so they have to outlive the process.
+/// last records before it, so they have to outlive the process. The cap bounds
+/// rclone's output only: rcsync's own few records always land, so the largest
+/// runs, which are the ones that hit the cap, still say how they ended.
 struct RunLog {
     file: File,
     path: PathBuf,
@@ -277,7 +283,7 @@ impl RunLog {
         let file = options.open(&path).ok()?;
         prune(dir, &safe);
         let mut log = Self { file, path, written: 0, cap, truncated: false };
-        log.write(
+        log.write_record(
             &serde_json::json!({
                 "rcsync": "run-start",
                 "project_id": project_id,
@@ -298,6 +304,12 @@ impl RunLog {
             let _ = writeln!(self.file, "{{\"rcsync\":\"log-truncated\"}}");
             return;
         }
+        if writeln!(self.file, "{line}").is_ok() {
+            self.written += line.len() + 1;
+        }
+    }
+
+    fn write_record(&mut self, line: &str) {
         if writeln!(self.file, "{line}").is_ok() {
             self.written += line.len() + 1;
         }
