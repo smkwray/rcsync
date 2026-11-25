@@ -5,151 +5,54 @@
 <h1 align="center">rcsync</h1>
 
 <p align="center">
-  A lightweight, keyboard-driven desktop app for syncing local project folders with cloud storage via <a href="https://rclone.org">rclone</a>.
-</p>
-
-<p align="center">
-  Built with <a href="https://tauri.app">Tauri v2</a> + <a href="https://svelte.dev">Svelte 5</a>. Configured to target macOS, Windows, and Linux.
+  A keyboard-driven desktop app for syncing local project folders with cloud storage through <a href="https://rclone.org">rclone</a>.
 </p>
 
 <p align="center">
   <img src="assets/screenshot.png" width="720" alt="rcsync dashboard" />
 </p>
 
----
+rcsync finds project folders on your computer, shows which ones have changed, and pushes them to Google Drive, OneDrive or any other rclone remote. It runs the rclone command for each action, so rclone must be installed and your remotes configured before you start. It is built with [Tauri v2](https://tauri.app) and [Svelte 5](https://svelte.dev).
 
-## What it does
+Local files are authoritative. Push runs without confirmation and makes the remote match your local folder, including deleting remote files that no longer exist locally. Pull, Bi-Sync and Delete each ask you to type a confirmation word (`pull`, `bisync`, `delete`), and Delete removes only the local copy.
 
-- **Push** local projects to Google Drive, OneDrive, or any rclone remote
-- **Check** which files differ between local and remote
-- **Pull** or **Bi-Sync** when needed (with safety confirmations)
-- **Auto-discover** local projects by scanning directories
-- **File watching** — detects local changes and marks projects as "modified"
-- **Multi-remote** support — switch between cloud drives with pill tabs
-- **Keyboard-driven** — vim-style navigation, single-key actions
-- **Pin projects** to the top of the dashboard (persists across sessions)
-- **Scheduled Push** — push a project on an interval or selected weekdays while rcsync is open
-- **Shared project config** — project definitions can sync between devices via Syncthing or similar; automation stays device-local
-- **Retired-target protection** — an explicit local deletion is recorded against its exact remote target, so a stale leftover discovered on another device cannot be pushed back without reattaching it
+The latest release has Windows x64 installers. On macOS, build from source; the last macOS download (v0.2.0) is for Apple silicon only and predates scheduled Push. Linux can be built from source but has no release. Release builds are unsigned, so Windows SmartScreen and macOS Gatekeeper warn on first launch.
 
-### Design philosophy
+## Features
 
-**Local is always authoritative.** Push is the default and runs unconfirmed. Pull, Bi-Sync and Delete each require you to type a confirmation word — `pull`, `bisync`, `delete` — with Cancel focused by default. Delete only removes the local copy; the remote is never touched.
+- Push, Pull, Bi-Sync, Check (compare without changing anything) and Dry Run (preview a Push) for each project, plus Check All, Push All and Bi-Sync All.
+- Finds projects by scanning local folders, and marks a project as modified when its files change.
+- Switches between several rclone remotes.
+- Pins projects to the top of the dashboard.
+- Pushes a project on a schedule (every few hours or days, or at a set time on chosen weekdays) while the app is open.
+- Shares project definitions between devices through a synced config file, while schedules stay on each device.
 
-Defaults are merged into your filter set and cannot be removed from configuration, so they are kept deliberately narrow: caches, virtualenvs, build output, VCS metadata and OS junk. Anything specific to how *you* organise a project belongs in `extra_excludes`, not here.
+## Setup
 
-## Prerequisites
+1. Install rclone, for example `brew install rclone` on macOS or `scoop install rclone` on Windows, or download it from [rclone.org](https://rclone.org/downloads/).
+2. Configure your remotes with `rclone config` (rcsync does not handle sign-in), then confirm they work:
 
-Building from source requires Node.js 18 or newer with npm, Rust with the
-stable toolchain, and the platform prerequisites listed in the
-[Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/). The
-release configuration targets macOS, Windows, and Linux; local release
-validation is recorded separately for each platform.
+   ```bash
+   rclone listremotes
+   rclone lsd gdrive:
+   ```
 
-### 1. Install rclone
+3. Keep each project as a folder under one base path on the remote, such as `gdrive:proj/my-webapp`.
 
-```bash
-# macOS (Homebrew)
-brew install rclone
-
-# Windows (Scoop)
-scoop install rclone
-
-# Or download from https://rclone.org/downloads/
-```
-
-### 2. Configure your remote(s)
-
-rcsync doesn't handle authentication — rclone does. Set up your remotes first:
-
-```bash
-# Interactive setup — follow the prompts
-rclone config
-
-# Example: set up Google Drive
-# Choose "Google Drive", follow OAuth flow, name it "gdrive"
-
-# Example: set up OneDrive
-# Choose "Microsoft OneDrive", follow OAuth flow, name it "onedrive"
-```
-
-After setup, verify your remotes work:
-
-```bash
-# List configured remotes
-rclone listremotes
-
-# Test access
-rclone lsd gdrive:
-rclone lsd onedrive:
-```
-
-### 3. Organize your projects
-
-rcsync expects projects to be folders under a base path on the remote. For example:
-
-```
-gdrive:proj/
-  ├── my-webapp/
-  ├── data-pipeline/
-  └── ml-experiment/
-```
-
-Push a project for the first time:
-
-```bash
-rclone sync ~/projects/my-webapp gdrive:proj/my-webapp
-```
-
-After that, rcsync handles all subsequent syncs through the UI.
-
-## Install
-
-### From source
+To build rcsync you need Node.js 18 or newer with npm, stable Rust, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
 
 ```bash
 git clone https://github.com/smkwray/rcsync.git
 cd rcsync
 npm ci
-npm run tauri build
+npm run tauri build    # the app is written to src-tauri/target/release/bundle/
 ```
 
-The built app is at `src-tauri/target/release/bundle/`.
-
-### Development
-
-```bash
-npm run tauri dev
-```
+Use `npm run tauri dev` to run it in development mode.
 
 ## Configuration
 
-rcsync uses a shared project config and a device-local automation config:
-
-### `defaults.json` (public, ships with the app)
-
-Contains exclude patterns and default scan directories. Safe to check into version control and share across devices.
-
-```json
-{
-  "excludes": [
-    "node_modules/**", ".git/**", ".worktrees/**",
-    ".venv*/**", ".tmp-validate-venv/**", "src-tauri/target/**",
-    ".cache/**",
-    "__pycache__/**", ".pytest_cache/**", ".mypy_cache/**", ".ruff_cache/**",
-    ".DS_Store", "._*", "Thumbs.db", "desktop.ini"
-  ],
-  "scan_dirs": ["~/projects"],
-  "default_pull_dir": "~/projects"
-}
-```
-
-### `rcsync-config.json` (private, portable)
-
-User-specific shared settings — remotes, projects, paths, and excludes. Stored
-next to the app binary (portable) so project definitions can sync between
-devices via Syncthing. Each project has a stable `id`; keep it when renaming a
-project so its device-local automation remains attached to the same project.
+rcsync reads `rcsync-config.json` from the folder that contains the app (set `RCSYNC_CONFIG` to use another path). It holds your remotes, scan folders, extra excludes and projects, and you can sync it between devices with Syncthing or similar. Each project has a stable `id`; keep it when you rename a project.
 
 ```json
 {
@@ -166,157 +69,55 @@ project so its device-local automation remains attached to the same project.
 }
 ```
 
-Default excludes are always applied. `extra_excludes` adds your own patterns on top — both are shown in Settings, but defaults can't be removed from the UI.
+| Setting | Description |
+|---|---|
+| `remote` | Active remote |
+| `remotes` | Available remotes and their base paths |
+| `scan_dirs` | Local folders to scan for projects |
+| `extra_excludes` | Your exclude patterns, added to the defaults |
+| `auto_check_on_launch` | Run Check All when the app opens |
+| `rclone_transfers` | Files transferred in parallel per rclone process, 1 to 8; omit it to use rclone's default |
 
-### Device-local automation config
+Every operation applies the default excludes from `src-tauri/defaults.json` (caches, virtual environments, build output, `.git` and OS metadata files) and your `extra_excludes`. The defaults cannot be removed in the app; a `defaults.json` next to the app, or the file named by `RCSYNC_DEFAULTS`, replaces the built-in copy.
 
-Schedules and the scheduled-Push queue policy are stored only on the device
-running rcsync, under the platform local application-data directory, in a file
-named `local-config-<device-id>.json`. On macOS this is normally under
-`~/Library/Application Support/rcsync`; on Windows it is normally under
-`%LOCALAPPDATA%\rcsync`. The stable device ID is kept separately in that same
-local-data directory and is not based solely on the hostname.
+Schedules are stored only on the device that runs them, in `local-config-<device-id>.json` under `~/Library/Application Support/rcsync` on macOS or `%LOCALAPPDATA%\rcsync` on Windows, so syncing `rcsync-config.json` does not start the same Push on another device. Press `t` on a project, or use its clock icon, to set one. If rcsync was closed when a Push was due, it runs one Push on the next launch. A failed scheduled Push is retried once an hour later. By default, scheduled Pushes run one at a time.
 
-This separation is intentional: syncing `rcsync-config.json` to a laptop does
-not turn on the same automatic Push there. If the same schedule is deliberately
-configured in both local automation files, both devices can still Push; rcsync
-does not provide a distributed cross-device lock.
+When you delete a project's local copy in rcsync, it marks its remote folder as retired, and Push and Bi-Sync stay blocked for that folder on every device that shares the config until you reattach it in the app.
 
-When rcsync deletes a local project, it also records the exact resolved remote
-target in the shared config as retired. A leftover directory discovered on
-another device remains visible for inspection, but Push, Bi-Sync, and Resync
-are blocked for that target until you explicitly reattach it. This protection
-matches the remote name and resolved remote path, not the local or project name,
-so an unrelated project with the same name is not blocked. Reattaching creates
-a new project identity and does not restore an old schedule or start a Push.
+## Safety limits
 
-A schedule runs only while rcsync is open. If the app is reopened after a due
-time, one stale Push is queued for each affected project; repeated missed
-occurrences coalesce into that one Push. A scheduled Push that was still queued,
-or was interrupted by quitting the app, counts as missed. A failed scheduled Push
-is retried once an hour later; if that also fails, it waits for the next due time.
-The Schedule Manager defaults new
-schedules to 24 hours and provides 12-, 24-, and 48-hour one-click presets.
-With **Queue scheduled pushes** enabled, scheduled Pushes run one at a time and
-due projects wait their turn. Push remains local-authoritative and can remove
-remote-only files.
-
-Older configs may contain `schedule` inside a project or
-`queue_scheduled_pushes` at the top level. Those shared legacy values are
-disabled on load. Use **Schedules → Move here** once, on the device that should
-own them, to copy them into the local automation config and remove them from
-the shared file. Migration is explicit so opening the same synced config on a
-second device cannot silently enable its schedules.
-
-Older releases could also create a whole config named for the machine. Those
-files are not selected automatically. If one is found, open Settings and use
-**Convert here** to copy it into the canonical `rcsync-config.json`; schedules
-still require the separate **Move here** action.
-
-```json
-{
-  "id": "p_8f5e7b7d2e3a91c4",
-  "name": "my-webapp",
-  "local_path": "~/projects/my-webapp",
-  "remote_path": "proj/my-webapp"
-}
-```
-
-Use the clock icon on a project card, or press `t` with a project selected, to
-edit its schedule. The scheduler uses the same Push path, filters, empty-source
-guard, cancellation, and progress reporting as a manual Push.
-
-### Key settings
-
-| Setting | File | Description |
-|---|---|---|
-| `excludes` | defaults.json | Base exclude patterns (shared) |
-| `extra_excludes` | rcsync-config.json | Additional user excludes (merged with defaults) |
-| `remote` | rcsync-config.json | Active remote name |
-| `remotes` | rcsync-config.json | Available remotes with their base paths |
-| `scan_dirs` | rcsync-config.json | Local directories to scan for project folders |
-| `auto_check_on_launch` | rcsync-config.json | Run Check All when the app opens |
-| `queue_scheduled_pushes` | device-local automation config | Queue scheduled Pushes so only one scheduled project runs at a time; enabled by default on each device |
-| `rclone_transfers` | rcsync-config.json | Files transferred in parallel per rclone process. Omit for Automatic (rclone's own setting); 1–8 otherwise |
-
-### Supported rclone configuration
-
-rcsync refuses to push a project whose source rclone considers empty, because
-`rclone sync` makes the destination match the source — an empty source would delete
-the remote copy. That guard works by asking rclone itself, with the same exclude
-arguments the push will use. Two boundaries follow from how it works:
-
-- **Don't modify a project while it is being pushed.** The check and the sync are two
-  rclone invocations. A source emptied between them can still be synced as empty.
-- **Remote-level `global.*` overrides in your rclone config are not supported.** The
-  guard inspects a local path, so a remote that rewrites sync or filter behaviour when
-  it is instantiated would affect the push without affecting the check.
-
-Ordinary rclone remotes — including anything configured through `rclone config` in the
-normal way — are unaffected by either.
-
-### Adding a new remote
-
-1. Configure it in rclone: `rclone config`
-2. Add it to `remotes` in rcsync settings (or edit the config file)
-3. Switch to it in Browse Remote using the pill tabs
+- Push refuses to run when rclone reports the local folder as empty, because syncing an empty folder would delete the remote copy. Do not change a project while it is being pushed: the empty check and the sync are separate rclone runs.
+- rclone remotes that override sync or filter options with `global.*` settings in the rclone config are not supported, because the empty check would not see those overrides.
+- rcsync stops a Push, Pull or Dry Run that shows no progress for 30 minutes, or reports none in its first 10 minutes, and marks it as failed. A stopped Push is retried once; a stopped Pull is not. Bi-Sync and Check are never stopped automatically, but you can cancel them.
+- Each run's rclone log is kept under `rcsync/run-logs/` in your user config folder (the newest 20 per project). These logs include local file paths.
 
 ## Keyboard shortcuts
 
-Toggle with the **Keys** checkbox or **Cmd+K**.
+Press `?` for this list in the app. **Cmd+K** or the **Keys** checkbox turns the single-key shortcuts on or off.
 
-| Key | Action | Always on? |
-|---|---|---|
-| `j` / `k` | Navigate down / up | |
-| `l` / `;` | Navigate left / right | |
-| `a` | Push selected | |
-| `s` | Dry Run | |
-| `d` | Check | |
-| `f` | Bi-Sync | |
-| `g` | Pull | |
-| `h` | Delete local | |
-| `t` | Schedule Push | |
-| `/` | Focus filter | |
-| `c` | Check All | |
-| `p` | Push All | |
-| `o` | Toggle output | |
-| `b` | Browse Remote | |
-| `?` | Shortcut help | Yes |
-| `Cmd+,` | Settings | Yes |
-| `Cmd+K` | Toggle shortcuts | Yes |
-| `Cmd+O` | Toggle output | Yes |
-| `Esc` | Close / deselect | Yes |
+| Key | Action |
+|---|---|
+| `j` `k` `l` `;` | Move down, up, left, right |
+| `/` | Focus the filter |
+| `a` `s` `d` `f` `g` | Push, Dry Run, Check, Bi-Sync, Pull the selected project |
+| `h` | Delete the selected project's local copy |
+| `e` `i` `t` `q` | Open folder, pin, schedule, cancel for the selected project |
+| `c` `p` `v` | Check All, Push All, Bi-Sync All |
+| `b` `m` | Browse remote, schedule manager |
+| `o` `x` | Toggle, clear the output log |
+| `Esc` | Deselect or close |
+| `Cmd+,` `Cmd+.` `Cmd+O` | Settings, cancel all operations, toggle output (always on) |
 
 ## How it works
 
-- **Push** = `rclone sync local remote` — one-way upload, local wins
-- **Pull** = `rclone sync remote local` — one-way download, remote wins
-- **Bi-Sync** = `rclone bisync local remote` — two-way merge
-- **Check** = `rclone check --combined` — compare without changing anything
-- **Dry Run** = `rclone sync --dry-run` — preview what Push would do
-
-All operations respect the configured exclude patterns.
-
-### Stalled runs
-
-rclone's own timeouts do not catch a process that stays alive but stops working, and one such
-process held the scheduled-Push queue for 23 hours. rcsync supervises `sync` (Push, Pull, Dry Run)
-and the empty-source `size` probe. For a sync it watches rclone's progress counters (bytes, files,
-checks, objects listed, deletes, renames, in-flight transfer bytes) and stops the run when none has
-changed for 30 minutes, or when no progress record has arrived within 10 minutes of starting. The
-`size` probe is stopped after 30 minutes of silence. Stopping sends SIGTERM, then SIGKILL after 15
-seconds (Windows terminates the process). A stopped run is reported as failed, never as a success.
-
-A stalled Push is retried once, after checking again that the source is not empty. A stalled Pull is
-not retried: it deletes local files to match the remote, so it waits for you to start it again.
-Bi-Sync and Check are not supervised, because a fixed timer has no model for a long check or for
-bisync saving its state; Cancel still works on them. The 30 minutes is a conservative heuristic, not
-a promise that a healthy but unusually quiet run is never stopped.
-
-Each rclone run's raw log is kept under `rcsync/run-logs/` in the per-user config
-directory (newest 20 per project, 16 MiB each) so the cause of a failure survives a restart. These
-records include local file paths. The Browse remote listing has its own 5-minute limit.
+| Action | rclone command |
+|---|---|
+| Push | `rclone sync <local> <remote>` |
+| Pull | `rclone sync <remote> <local>` |
+| Bi-Sync | `rclone bisync <local> <remote>` |
+| Check | `rclone check --combined` |
+| Dry Run | `rclone sync --dry-run` |
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
